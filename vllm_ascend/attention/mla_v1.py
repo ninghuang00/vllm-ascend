@@ -981,8 +981,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                 post_process_after_loading_for_shard_weight_series(layer)
 
     def _process_weights_for_fused_fa_quant(self):
-        self.gamma1 = self.q_a_layernorm.weight.data  # type: ignore[union-attr]
-        self.gamma2 = self.kv_a_layernorm.weight.data  # type: ignore[union-attr]
+        # assert self.q_a_layernorm is not None, "q_a_layernorm required for fa_quant"
+        # assert self.kv_a_layernorm is not None, "kv_a_layernorm required for fa_quant"
+        self.gamma1 = self.q_a_layernorm.weight.data
+        self.gamma2 = self.kv_a_layernorm.weight.data
 
         wu_q = self.q_proj.weight.data
 
@@ -1284,10 +1286,32 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
     ):
-        assert self.kv_a_layernorm is not None
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
+        if self.kv_a_layernorm is None:
+            # D = self.kv_lora_rank
+            # R = self.qk_rope_head_dim
+            # k_nope = kv_no_split[:, :D].contiguous()
+            # k_pe_in = kv_no_split[:, D:].contiguous()
+            # k_pe = k_pe_in.view(B, N, S, R)
+            # k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            # k_pe = k_pe.view(B, N, R)
+            # torch_npu._npu_reshape_and_cache(
+            #     key=k_nope.view(B, N, D),
+            #     value=k_pe,
+            #     key_cache=kv_cache[0],
+            #     value_cache=kv_cache[1],
+            #     slot_indices=slots.to(torch.int32),
+            # )
+            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
+            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+
+            return kv_cache[1], kv_cache[0]
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA_NZ" if self.enable_kv_nz else "PA"
@@ -1312,10 +1336,32 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
     ):
-        assert self.kv_a_layernorm is not None
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
+        
+        if self.kv_a_layernorm is None:
+            # D = self.kv_lora_rank
+            # R = self.qk_rope_head_dim
+            # k_nope = kv_no_split[:, :D].contiguous()
+            # k_pe_in = kv_no_split[:, D:].contiguous()
+            # k_pe = k_pe_in.view(B, N, S, R)
+            # k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            # k_pe = k_pe.view(B, N, R)
+            # torch_npu._npu_reshape_and_cache(
+            #     key=k_nope.view(B, N, D),
+            #     value=k_pe,
+            #     key_cache=kv_cache[0],
+            #     value_cache=kv_cache[1],
+            #     slot_indices=slots.to(torch.int32),
+            # )
+            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
+            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+            return k_pe, k_nope
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
@@ -1583,7 +1629,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)  # type: ignore[misc]
+            if self.q_a_layernorm is not None:
+                q_c = self.q_a_layernorm(q_c)
             # allgather need contiguous data
             kv_no_split = kv_no_split.contiguous()
         else:
