@@ -3271,7 +3271,9 @@ class NPUModelRunner(GPUModelRunner):
                         cache_sparse_c8=self.use_sparse_c8_indexer,
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    assert isinstance(spec, MLAAttentionSpec)
+                    assert type(spec).__name__ == "MLAAttentionSpec", (
+                        f"Expected MLAAttentionSpec, got {type(spec).__name__}"
+                    )
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                     if getattr(attn_module.impl, "fa_quant_layer", False):
                         head_size = attn_module.head_size + attn_module.qk_rope_head_dim
