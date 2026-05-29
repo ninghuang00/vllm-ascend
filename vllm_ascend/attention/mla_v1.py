@@ -722,6 +722,8 @@ class PrefillMLAPreprocessResult(NamedTuple):
     k_pe: Optional[torch.Tensor] = None
     value: Optional[torch.Tensor] = None
 
+def _layernorm_skip(ln):
+    return ln is None or getattr(ln, 'skip', False)
 
 class AscendMLAImpl(MLAAttentionImpl):
     """
@@ -1083,6 +1085,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         N = self.num_kv_heads
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
+        if _layernorm_skip(self.kv_a_layernorm):
+                k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+                update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+                torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+                update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
+                torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+                return kv_cache[1], kv_cache[0]
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
@@ -1111,6 +1121,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         N = self.num_kv_heads
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
+        if _layernorm_skip(self.kv_a_layernorm):
+                k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+                update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+                torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+                update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
+                torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+                return k_pe, k_nope
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
