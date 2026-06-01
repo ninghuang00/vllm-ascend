@@ -4,6 +4,7 @@ from typing import (TYPE_CHECKING, ClassVar, NamedTuple, Optional, Tuple, Type,
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch_npu
 from torch import nn
 from vllm.attention.backends.abstract import AttentionBackend, MLAAttentionImpl
@@ -722,6 +723,8 @@ class PrefillMLAPreprocessResult(NamedTuple):
     k_pe: Optional[torch.Tensor] = None
     value: Optional[torch.Tensor] = None
 
+def _layernorm_skip(ln):
+    return ln is None or getattr(ln, 'skip', False)
 
 class AscendMLAImpl(MLAAttentionImpl):
     """
@@ -1083,6 +1086,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         N = self.num_kv_heads
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
+        if _layernorm_skip(self.kv_a_layernorm):
+            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
+            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+            return kv_cache[1], kv_cache[0]
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
@@ -1111,6 +1122,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         N = self.num_kv_heads
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
+        if _layernorm_skip(self.kv_a_layernorm):
+            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
+            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+            return k_pe, k_nope
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
@@ -1210,6 +1229,24 @@ class AscendMLAImpl(MLAAttentionImpl):
             graph_params = get_mtp_graph_params()
         else:
             graph_params = get_graph_params()
+
+        # --- 新增：处理 Padding 逻辑 ---
+        # 原始 head 是 40，目标 head 是 64
+        target_heads = 64
+
+        # 4维: [num_tokens, target_heads, 1, dim]
+        padded_q_nope_shape = (num_tokens, target_heads, 1, q_nope.shape[-1])
+        padded_q_pe_shape = (num_tokens, target_heads, 1, q_pe.shape[-1])
+
+        # 创建用于 Graph 的静态 Padding 张量
+        # 创建静态 Padding 张量
+        padded_q_nope = torch.zeros(padded_q_nope_shape, dtype=q_nope.dtype, device=q_nope.device)
+        padded_q_pe = torch.zeros(padded_q_pe_shape, dtype=q_pe.dtype, device=q_pe.device)
+        
+        # 将原始数据拷贝进去（这是会被记录在 Graph 中的操作）
+        padded_q_nope[:, :self.num_heads, :, :].copy_(q_nope)
+        padded_q_pe[:, :self.num_heads, :, :].copy_(q_pe)
+
         if forward_context.capturing:
             stream = torch_npu.npu.current_stream()
 
@@ -1218,14 +1255,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             event.reset(stream)
             graph_params.events[num_tokens].append(event)
 
+            # 更新 common_kwargs 供后续使用
+            common_kwargs['query_rope'] = padded_q_pe
+            common_kwargs['num_heads'] = target_heads
+            # ------------------------------
+
             workspace = graph_params.workspaces.get(num_tokens)
             if workspace is None:
                 workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                    q_nope, k_nope, k_nope, **common_kwargs)
+                    padded_q_nope, k_nope, k_nope, **common_kwargs)
                 update_graph_params_workspaces(num_tokens, workspace)
 
-            attn_output = torch.empty(
-                (q_nope.shape[1], q_nope.shape[0], *q_nope.shape[2:]),
+            padded_attn_output = torch.empty(
+                (target_heads, q_nope.shape[0], *q_nope.shape[2:]),
                 dtype=q_nope.dtype,
                 device=q_nope.device)
             softmax_lse = torch.empty(num_tokens,
@@ -1233,27 +1275,32 @@ class AscendMLAImpl(MLAAttentionImpl):
                                       device=q_nope.device)
 
             graph_params.attn_params[num_tokens].append(
-                (weak_ref_tensors(q_nope), weak_ref_tensors(k_nope),
-                 weak_ref_tensors(q_pe), weak_ref_tensors(k_pe),
-                 self.num_heads, self.num_kv_heads, input_layout,
+                (weak_ref_tensors(padded_q_nope), weak_ref_tensors(k_nope),
+                 weak_ref_tensors(padded_q_pe), weak_ref_tensors(k_pe),
+                 target_heads, self.num_kv_heads, input_layout,
                  weak_ref_tensors(spec_attn_mask) if spec_attn_mask is not None
                  else None, sparse_mode, self.scale, decode_meta.block_table,
                  block_size, decode_meta.seq_lens_list, actual_seq_lengths,
-                 weak_ref_tensors(attn_output), weak_ref_tensors(softmax_lse)))
+                 weak_ref_tensors(padded_attn_output), weak_ref_tensors(softmax_lse)))
 
             torch.npu.graph_task_group_begin(stream)
             torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
+                padded_q_nope,
                 k_nope,
                 k_nope,
                 **common_kwargs,
                 workspace=workspace,
-                out=[attn_output, softmax_lse])
+                out=[padded_attn_output, softmax_lse])
             handle = torch.npu.graph_task_group_end(stream)
             graph_params.handles[num_tokens].append(handle)
+            # 还原输出形状：切片回原始 heads
+            attn_output = padded_attn_output[:self.num_heads]
         else:
+            common_kwargs["query_rope"] = padded_q_pe
+            common_kwargs["num_heads"] = target_heads
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-                q_nope, k_nope, k_nope, **common_kwargs)
+                padded_q_nope, k_nope, k_nope, **common_kwargs)
+            attn_output = attn_output[:self.num_heads]
 
         return self._v_up_proj(attn_output)
 
