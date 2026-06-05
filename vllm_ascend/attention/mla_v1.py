@@ -726,6 +726,36 @@ class PrefillMLAPreprocessResult(NamedTuple):
 def _layernorm_skip(ln):
     return ln is None or getattr(ln, 'skip', False)
 
+def _get_padded_num_heads(num_heads: int, max_heads: int = 128) -> int:
+    """
+    Calculate the nearest power-of-2 head count that satisfies hardware constraints.
+    
+    Ascend NPU's npu_fused_infer_attention_score requires the group number (num_heads / num_kv_heads)
+    to be a power of 2 in the range [1, 2, 4, 8, 16, 32, 64, 128] when:
+    - In NO_QUANT mode
+    - With ROPE enabled
+    - QK head dimension = 512
+    
+    Args:
+        num_heads: Original number of query heads
+        max_heads: Maximum supported head count (default 128)
+    
+    Returns:
+        Padded head count (power of 2) if num_heads doesn't satisfy constraints,
+        otherwise returns num_heads unchanged
+    """
+    supported_heads = [1, 2, 4, 8, 16, 32, 64, 128]
+    
+    if num_heads in supported_heads:
+        return num_heads
+    
+    # Find the nearest power-of-2 that is >= num_heads and <= max_heads
+    padded_heads = 1
+    while padded_heads < num_heads and padded_heads < max_heads:
+        padded_heads *= 2
+    
+    return min(padded_heads, max_heads)
+
 class AscendMLAImpl(MLAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -1230,22 +1260,29 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             graph_params = get_graph_params()
 
-        # --- 新增：处理 Padding 逻辑 ---
-        # 原始 head 是 40，目标 head 是 64
-        target_heads = 64
-
-        # 4维: [num_tokens, target_heads, 1, dim]
-        padded_q_nope_shape = (num_tokens, target_heads, 1, q_nope.shape[-1])
-        padded_q_pe_shape = (num_tokens, target_heads, 1, q_pe.shape[-1])
-
-        # 创建用于 Graph 的静态 Padding 张量
-        # 创建静态 Padding 张量
-        padded_q_nope = torch.zeros(padded_q_nope_shape, dtype=q_nope.dtype, device=q_nope.device)
-        padded_q_pe = torch.zeros(padded_q_pe_shape, dtype=q_pe.dtype, device=q_pe.device)
+        # Determine if padding is needed based on hardware constraints
+        # Ascend NPU requires num_heads to be a power of 2 (1, 2, 4, 8, 16, 32, 64, 128)
+        # for optimized execution paths in NO_QUANT mode with ROPE and 512-dim QK heads
+        target_heads = _get_padded_num_heads(self.num_heads)
         
-        # 将原始数据拷贝进去（这是会被记录在 Graph 中的操作）
-        padded_q_nope[:, :self.num_heads, :, :].copy_(q_nope)
-        padded_q_pe[:, :self.num_heads, :, :].copy_(q_pe)
+        if target_heads != self.num_heads:
+            # Padding is required to satisfy hardware constraints
+            # Create padded tensors with power-of-2 head count for optimal hardware utilization
+            padded_q_nope_shape = (num_tokens, target_heads, 1, q_nope.shape[-1])
+            padded_q_pe_shape = (num_tokens, target_heads, 1, q_pe.shape[-1])
+            
+            # Initialize padded tensors with zeros for Graph capture compatibility
+            padded_q_nope = torch.zeros(padded_q_nope_shape, dtype=q_nope.dtype, device=q_nope.device)
+            padded_q_pe = torch.zeros(padded_q_pe_shape, dtype=q_pe.dtype, device=q_pe.device)
+            
+            # Copy original query data to the first num_heads positions
+            # The remaining positions (num_heads to target_heads-1) stay as zeros
+            padded_q_nope[:, :self.num_heads, :, :].copy_(q_nope)
+            padded_q_pe[:, :self.num_heads, :, :].copy_(q_pe)
+        else:
+            # No padding needed, use original tensors directly
+            padded_q_nope = q_nope
+            padded_q_pe = q_pe
 
         if forward_context.capturing:
             stream = torch_npu.npu.current_stream()
@@ -1255,10 +1292,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             event.reset(stream)
             graph_params.events[num_tokens].append(event)
 
-            # 更新 common_kwargs 供后续使用
+            # Update common_kwargs with padded query tensors and target head count
             common_kwargs['query_rope'] = padded_q_pe
             common_kwargs['num_heads'] = target_heads
-            # ------------------------------
 
             workspace = graph_params.workspaces.get(num_tokens)
             if workspace is None:
@@ -1266,6 +1302,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     padded_q_nope, k_nope, k_nope, **common_kwargs)
                 update_graph_params_workspaces(num_tokens, workspace)
 
+            # Allocate output tensor with target head count
             padded_attn_output = torch.empty(
                 (target_heads, q_nope.shape[0], *q_nope.shape[2:]),
                 dtype=q_nope.dtype,
@@ -1293,14 +1330,21 @@ class AscendMLAImpl(MLAAttentionImpl):
                 out=[padded_attn_output, softmax_lse])
             handle = torch.npu.graph_task_group_end(stream)
             graph_params.handles[num_tokens].append(handle)
-            # 还原输出形状：切片回原始 heads
-            attn_output = padded_attn_output[:self.num_heads]
+            
+            # Slice output back to original head count if padding was applied
+            if target_heads != self.num_heads:
+                attn_output = padded_attn_output[:self.num_heads]
+            else:
+                attn_output = padded_attn_output
         else:
             common_kwargs["query_rope"] = padded_q_pe
             common_kwargs["num_heads"] = target_heads
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 padded_q_nope, k_nope, k_nope, **common_kwargs)
-            attn_output = attn_output[:self.num_heads]
+            
+            # Slice output back to original head count if padding was applied
+            if target_heads != self.num_heads:
+                attn_output = attn_output[:self.num_heads]
 
         return self._v_up_proj(attn_output)
 
