@@ -2386,13 +2386,13 @@ class NPUModelRunner(GPUModelRunner):
                                                dsa_k_cache_factor)
                     else:
                         # for other deepseek models, use MLAAttentionSpec
-                        k_tensor_split_factor = head_size / self.model_config.hf_text_config.kv_lora_rank
-                        v_tensor_split_factor = head_size / self.model_config.hf_text_config.qk_rope_head_dim
-
-                    k_tensor_size = int(kv_cache_tensor.size //
-                                        k_tensor_split_factor)
-                    v_tensor_size = int(kv_cache_tensor.size //
-                                        v_tensor_split_factor)
+                        # Use integer arithmetic to avoid truncation errors
+                        kv_lora_rank = self.model_config.hf_text_config.kv_lora_rank
+                        qk_rope_head_dim = self.model_config.hf_text_config.qk_rope_head_dim
+                        # head_size = kv_lora_rank + qk_rope_head_dim
+                        # k_tensor_size : v_tensor_size = kv_lora_rank : qk_rope_head_dim
+                        k_tensor_size = kv_cache_tensor.size * kv_lora_rank // head_size
+                        v_tensor_size = kv_cache_tensor.size - k_tensor_size  # Ensure sum equals total
 
                     # for other attentions, e.g., self_attn, sliding window attn
                     if self.vllm_config.kv_transfer_config is None:
@@ -2473,7 +2473,43 @@ class NPUModelRunner(GPUModelRunner):
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
-                if isinstance(kv_cache_spec, FullAttentionSpec):
+                # MLAAttentionSpec inherits from FullAttentionSpec, so check it first
+                if isinstance(kv_cache_spec, MLAAttentionSpec):
+                    raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
+                        layer_name]
+                    # Use kv_cache_config.num_blocks directly to avoid truncation errors
+                    # from int() in _allocate_kv_cache_tensors
+                    num_blocks = kv_cache_config.num_blocks
+
+                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    # k_cache: nope_cache    v_cache: rope_cache
+                    mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
+                    k_shape = [
+                        mla_num_blocks, mla_block_size, num_kv_heads,
+                        self.model_config.hf_text_config.kv_lora_rank
+                    ]
+                    v_shape = [
+                        mla_num_blocks, mla_block_size, num_kv_heads,
+                        self.model_config.hf_text_config.qk_rope_head_dim
+                    ]
+                    # Calculate exact sizes needed (in bytes, which equals int8 elements)
+                    k_size_needed = int(mla_num_blocks * mla_block_size * num_kv_heads * self.model_config.hf_text_config.kv_lora_rank * dtype.itemsize)
+                    v_size_needed = int(mla_num_blocks * mla_block_size * num_kv_heads * self.model_config.hf_text_config.qk_rope_head_dim * dtype.itemsize)
+                    logger.info(f"MLA reshape: layer={layer_name}, num_blocks={num_blocks}, "
+                                f"k_shape={k_shape}, v_shape={v_shape}, "
+                                f"k_size_needed={k_size_needed}, v_size_needed={v_size_needed}, "
+                                f"raw_k_size={raw_k_tensor.numel()}, raw_v_size={raw_v_tensor.numel()}")
+                    k_cache = raw_k_tensor[:k_size_needed].view(dtype).view(k_shape)
+                    v_cache = raw_v_tensor[:v_size_needed].view(dtype).view(v_shape)
+                    if get_ascend_device_type() == AscendDeviceType._310P:
+                        k_cache = maybe_trans_nz(k_cache)
+                        v_cache = maybe_trans_nz(v_cache)
+                    kv_caches[layer_name] = (k_cache, v_cache)
+                elif isinstance(kv_cache_spec, FullAttentionSpec):
                     raw_dsa_k_tensor = None
                     if self.use_sparse:
                         raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor = kv_cache_raw_tensors[  # type: ignore
