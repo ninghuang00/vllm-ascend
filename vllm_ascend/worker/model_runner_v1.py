@@ -268,7 +268,10 @@ class NPUModelRunner(GPUModelRunner):
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None) if model_config else None
         self.use_compress = (
-            hf_config is not None and hasattr(hf_config, "compress_ratios")
+            hf_config is not None and (
+                hasattr(hf_config, "compress_ratios") or
+                hasattr(hf_config, "kv_lora_rank")
+            )
         )
 
         with _torch_cuda_wrapper():
@@ -4177,12 +4180,18 @@ class NPUModelRunner(GPUModelRunner):
                     assert num_blocks == kv_cache_config.num_blocks, \
                         f"num_blocks: {num_blocks} should be equal to " \
                         f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
-                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                    
+                    k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
+                    kv_nope_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, current_kv_cache_spec.block_size,
                         current_kv_cache_spec.num_kv_heads,
-                        current_kv_cache_spec.head_size)
-                    kv_cache_shape_list = [kv_cache_shape]
-                    kv_cache_dtype_list = [current_kv_cache_spec.dtype]
+                        k_dim)
+                    kv_rope_shape = self.attn_backend.get_kv_cache_shape(
+                        num_blocks, current_kv_cache_spec.block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        v_dim)
+                    kv_cache_shape_list = [kv_nope_shape, kv_rope_shape]
+                    kv_cache_dtype_list = [current_kv_cache_spec.dtype, current_kv_cache_spec.dtype]
                     overlap_full_kv_cache = False
 
                     if hasattr(current_kv_cache_spec, "scale_dim") and current_kv_cache_spec.scale_dim != 0:
