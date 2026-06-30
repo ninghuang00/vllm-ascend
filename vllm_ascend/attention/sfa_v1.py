@@ -766,11 +766,74 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        # Use PyTorch native interleaved (GPT-J style) rope implementation
+        # instead of npu_interleave_rope which requires hiddenDim=64
         B, N, D = x.shape
-        S = 1
-        x = x.view(B, N, S, D)
-        x = torch_npu.npu_interleave_rope(x, cos, sin)
-        return x.view(B, N, D)
+        
+        # cos/sin shape: [S, D] or [S, 1, D]
+        # For interleaved rope, we need cos/sin with shape compatible with x1, x2
+        # x1 = x[..., ::2] (even indices), x2 = x[..., 1::2] (odd indices)
+        
+        # Handle different cos/sin shapes
+        if cos.dim() == 4:
+            # cos: [S, 1, 1, D] -> [S, D]
+            cos = cos.squeeze(1).squeeze(1)
+            sin = sin.squeeze(1).squeeze(1)
+        elif cos.dim() == 3:
+            # cos: [S, 1, D] -> [S, D]
+            cos = cos.squeeze(1)
+            sin = sin.squeeze(1)
+        
+        # For interleaved rope with full rotary_dim (D=128):
+        # cos/sin have shape [S, D], but we need [S, D//2] for the formula
+        # The standard approach: cos[i] applies to position 2i, sin[i] to position 2i+1
+        # So we extract cos/sin at even positions for interleaved format
+        
+        # Alternative interpretation for MLA:
+        # cos/sin already have the correct shape [S, D//2] = [S, 64]
+        # and the full D=128 in cos/sin means each value is duplicated
+        
+        # Let's handle both cases:
+        if cos.shape[-1] == D:
+            # cos/sin have full dimension, need to extract half
+            cos_half = cos[..., :D//2]  # [S, 64]
+            sin_half = sin[..., :D//2]  # [S, 64]
+        else:
+            # cos/sin already have half dimension
+            cos_half = cos
+            sin_half = sin
+        
+        # Reshape cos/sin for broadcasting with x
+        # x: [B, N, D], x1/x2: [B, N, D//2]
+        # cos/sin: [S, D//2] -> need to broadcast to [B, N, D//2]
+        # Since S=1 typically for decode, we can handle general S
+        S = cos_half.shape[0]
+        cos_half = cos_half.view(S, 1, D//2)  # [S, 1, D//2]
+        sin_half = sin_half.view(S, 1, D//2)  # [S, 1, D//2]
+        
+        # If B > S, we need to expand cos/sin
+        if B > S:
+            cos_half = cos_half.expand(B, 1, D//2)
+            sin_half = sin_half.expand(B, 1, D//2)
+        
+        cos_half = cos_half.squeeze(1)  # [B or S, D//2]
+        sin_half = sin_half.squeeze(1)  # [B or S, D//2]
+        
+        # Expand for broadcasting with [B, N, D//2]
+        cos_half = cos_half.unsqueeze(-2)  # [B, 1, D//2]
+        sin_half = sin_half.unsqueeze(-2)  # [B, 1, D//2]
+        
+        # Interleaved rope formula (GPT-J style)
+        x1 = x[..., ::2]  # [B, N, D//2] even indices
+        x2 = x[..., 1::2]  # [B, N, D//2] odd indices
+        
+        o1 = x1 * cos_half - x2 * sin_half
+        o2 = x2 * cos_half + x1 * sin_half
+        
+        # Stack and flatten back to interleaved format
+        output = torch.stack((o1, o2), dim=-1).flatten(-2)  # [B, N, D]
+        
+        return output
 
     def _init_o_proj_tp_full_params(self):
         """

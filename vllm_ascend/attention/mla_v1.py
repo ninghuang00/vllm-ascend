@@ -1222,7 +1222,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
             common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
 
-            if self.head_padding > 0:
+            if self.head_padding > 0 or self.qk_rope_head_dim != 64:
                 key = torch.cat((k_nope, k_pe), dim=-1)
             else:
                 common_kwargs["query_rope"] = q_pe
@@ -1242,6 +1242,59 @@ class AscendMLAImpl(MLAAttentionImpl):
         output_final, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
         return output_final.view(num_tokens, H, D), None
 
+    def _forward_prefill_fallback(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        actual_seq_lengths: list,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, num_heads, head_dim = query.shape
+        output = torch.empty(num_tokens, num_heads, value.shape[-1], dtype=query.dtype, device=query.device)
+        lse = torch.empty(num_heads, num_tokens, dtype=torch.float32, device=query.device)
+        
+        # actual_seq_lengths is already a list, no need to call tolist()
+        if isinstance(actual_seq_lengths, torch.Tensor):
+            seq_starts = [0] + actual_seq_lengths.tolist()
+        else:
+            seq_starts = [0] + actual_seq_lengths
+        
+        for i in range(len(actual_seq_lengths)):
+            start_q = seq_starts[i]
+            end_q = seq_starts[i + 1]
+            seq_len = end_q - start_q
+            
+            q_seq = query[start_q:end_q]
+            k_seq = key[start_q:end_q]
+            v_seq = value[start_q:end_q]
+            
+            q_seq = q_seq.transpose(0, 1)
+            k_seq = k_seq.transpose(0, 1)
+            v_seq = v_seq.transpose(0, 1)
+            
+            attn_weights = torch.matmul(q_seq, k_seq.transpose(-2, -1)) * scale
+            
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=query.device),
+                diagonal=1
+            )
+            attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
+            
+            attn_weights_max = attn_weights.max(dim=-1, keepdim=True).values
+            attn_weights_exp = torch.exp(attn_weights - attn_weights_max)
+            attn_probs = attn_weights_exp / attn_weights_exp.sum(dim=-1, keepdim=True)
+            
+            out_seq = torch.matmul(attn_probs, v_seq)
+            out_seq = out_seq.transpose(0, 1)
+            
+            output[start_q:end_q] = out_seq
+            
+            log_sum_exp = attn_weights_max.squeeze(-1) + torch.log(attn_weights_exp.sum(dim=-1))
+            lse[:, start_q:end_q] = log_sum_exp
+        
+        return output, lse
+
     def _forward_prefill(
         self,
         q_nope: torch.Tensor,
@@ -1258,9 +1311,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_meta = attn_metadata.prefill
 
         actual_seq_lengths_q = prefill_meta.actual_seq_lengths_q
-        actual_seq_lengths_kv = actual_seq_lengths_q.copy()
 
-        # FIA with TND layout only supports bfloat16, convert if needed
         original_dtype = q_nope.dtype
         need_dtype_convert = original_dtype != torch.bfloat16
         if need_dtype_convert:
@@ -1270,34 +1321,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             k_pe = k_pe.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
 
-        attn_output = torch.empty(num_tokens, self.num_heads, self.v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
-        attn_lse = torch.empty(self.num_heads, num_tokens, dtype=torch.float32, device=q_nope.device)
+        query = torch.cat((q_nope, q_pe), dim=-1)
+        key = torch.cat((k_nope, k_pe), dim=-1)
 
-        common_kwargs = {
-            "num_heads": self.num_heads,
-            "num_key_value_heads": self.num_heads,
-            "input_layout": "TND",
-            "atten_mask": prefill_meta.attn_mask,
-            "sparse_mode": 3,
-            "scale": self.scale,
-            "antiquant_mode": 0,
-            "antiquant_scale": None,
-            "block_table": None,
-            "block_size": 0,
-            "softmax_lse_flag": True,
-            "actual_seq_lengths": actual_seq_lengths_q,
-            "actual_seq_lengths_kv": actual_seq_lengths_kv,
-        }
-
-        if self.head_padding > 0:
-            query = torch.cat((q_nope, q_pe), dim=-1)
-            key = torch.cat((k_nope, k_pe), dim=-1)
-        else:
-            common_kwargs["query_rope"] = q_pe
-            common_kwargs["key_rope"] = k_pe
-            query, key = q_nope, k_nope
-
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(query, key, value, **common_kwargs)
+        attn_output, attn_lse = self._forward_prefill_fallback(
+            query, key, value, actual_seq_lengths_q, self.scale
+        )
 
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse
@@ -1305,105 +1334,57 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim])
 
-        # Convert back to original dtype if needed
         if need_dtype_convert:
             attn_output = attn_output.to(original_dtype)
 
         return attn_output
 
-    def exec_kv_decode(
+    def _forward_decode_fallback(
         self,
-        kv_no_split: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache: tuple,
-        slots: torch.Tensor,
-    ):
-        assert self.kv_a_layernorm is not None
-        B = kv_no_split.shape[0]
-        N = self.num_kv_heads
-        S = 1
-        if _layernorm_skip(self.kv_a_layernorm):
-            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
-            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
-            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
-            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
-
-            return kv_cache[1], kv_cache[0]
-        # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
-        kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
-        cache_mode = "PA_NZ" if self.enable_kv_nz else "PA"
-        c_kv_scale = None
-        if get_ascend_device_type() == AscendDeviceType.A5 and self.fa_quant_layer:
-            c_kv_scale = self.fak_descale_reciprocal
-        k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
-            kv_no_split,
-            self.kv_a_layernorm.weight,  # type: ignore[union-attr]
-            cos,
-            sin,
-            slots.to(torch.int64),
-            kv_cache[1],
-            kv_cache[0],
-            c_kv_scale=c_kv_scale,
-            epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
-            cache_mode=cache_mode,
-        )
-        return k_pe, k_nope
-
-    def exec_kv_prefill(
-        self,
-        kv_no_split: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache: tuple,
-        slots: torch.Tensor,
-    ):
-        assert self.kv_a_layernorm is not None
-        B = kv_no_split.shape[0]
-        N = self.num_kv_heads
-        S = 1
-        if _layernorm_skip(self.kv_a_layernorm):
-            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
-            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
-            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
-            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
-            return k_pe, k_nope
-        # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
-        kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
-        cache_mode = "PA"
-        c_kv_scale = None
-        if get_ascend_device_type() == AscendDeviceType.A5 and self.fa_quant_layer:
-            c_kv_scale = self.fak_descale_reciprocal
-        _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
-            kv_no_split,
-            self.kv_a_layernorm.weight,  # type: ignore[union-attr]
-            cos,
-            sin,
-            slots.to(torch.int64),
-            kv_cache[1],
-            kv_cache[0],
-            c_kv_scale=c_kv_scale,
-            epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
-            cache_mode=cache_mode,
-            is_output_kv=True,
-        )
-        return k_pe, k_nope
-
-    def rope_single(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope_cache: torch.Tensor,
+        k_pe_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        scale: float,
+        num_heads: int,
+        num_kv_heads: int,
+        kv_lora_rank: int,
+        block_size: int,
     ) -> torch.Tensor:
-        B, N, D = x.shape
-        S = 1
-        x = x.view(B, N, S, D)
-        x = torch_npu.npu_interleave_rope(x, cos, sin)
-        return x.view(B, N, D)
+        num_tokens = q_nope.shape[0]
+        output = torch.empty(num_heads, num_tokens, kv_lora_rank, dtype=q_nope.dtype, device=q_nope.device)
+        
+        query = torch.cat([q_nope, q_pe], dim=-1)
+        query = query.view(num_tokens, num_heads, -1)
+        
+        for token_idx in range(num_tokens):
+            block_ids = block_table[token_idx]
+            seq_len = seq_lens[token_idx].item() if isinstance(seq_lens[token_idx], torch.Tensor) else seq_lens[token_idx]
+            
+            num_blocks = (seq_len + block_size - 1) // block_size
+            
+            k_nope_blocks = k_nope_cache[block_ids[:num_blocks]]
+            k_pe_blocks = k_pe_cache[block_ids[:num_blocks]]
+            
+            k_nope_flat = k_nope_blocks.reshape(-1, kv_lora_rank)
+            k_pe_flat = k_pe_blocks.reshape(-1, k_pe_cache.shape[-1])
+            k_flat = torch.cat([k_nope_flat, k_pe_flat], dim=-1)
+            
+            q_token = query[token_idx]
+            
+            for head_idx in range(num_heads):
+                q_h = q_token[head_idx]
+                k_h = k_flat
+                
+                attn_score = torch.matmul(q_h, k_h.T) * scale
+                attn_probs = torch.softmax(attn_score, dim=-1)
+                
+                out_h = torch.matmul(attn_probs, k_nope_flat)
+                output[head_idx, token_idx] = out_h
+        
+        return output
 
     def _forward_decode(
         self,
@@ -1417,12 +1398,19 @@ class AscendMLAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         decode_meta = attn_metadata.decode
         assert decode_meta is not None
-        # TODO: The CANN package is expected to support num_heads that are not
-        # powers of 2 in 2026 Q2. Once supported, all padding operations under
-        # `if self.head_padding > 0` in this function can be removed.
         num_tokens = q_nope.size(0)
-        # shape of knope/k_pe for npu graph mode should be:
-        # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
+        
+        if self.qk_rope_head_dim != 64:
+            attn_output = self._forward_decode_fallback(
+                q_nope, q_pe, k_nope, k_pe,
+                decode_meta.block_table, decode_meta.seq_lens_list,
+                self.scale, self.num_heads, self.num_kv_heads,
+                self.kv_lora_rank, block_size
+            )
+            if self.head_padding > 0:
+                attn_output = attn_output[:self.num_heads]
+            return self._v_up_proj(attn_output)
+        
         actual_seq_lengths = None
         if self.fa_quant_layer and get_ascend_device_type() != AscendDeviceType.A5:
             nz_fmt_last_dim = 16
@@ -1613,6 +1601,175 @@ class AscendMLAImpl(MLAAttentionImpl):
 
     def reorg_decode_q(self, decode_q_nope, decode_q_pe):
         return decode_q_nope, decode_q_pe
+
+    def rope_single(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        # Use PyTorch native interleaved (GPT-J style) rope implementation
+        # instead of npu_interleave_rope which requires hiddenDim=64
+        B, N, D = x.shape
+        
+        # cos/sin shape: [S, D] or [S, 1, D]
+        # For interleaved rope, we need cos/sin with shape compatible with x1, x2
+        # x1 = x[..., ::2] (even indices), x2 = x[..., 1::2] (odd indices)
+        
+        # Handle different cos/sin shapes
+        if cos.dim() == 4:
+            # cos: [S, 1, 1, D] -> [S, D]
+            cos = cos.squeeze(1).squeeze(1)
+            sin = sin.squeeze(1).squeeze(1)
+        elif cos.dim() == 3:
+            # cos: [S, 1, D] -> [S, D]
+            cos = cos.squeeze(1)
+            sin = sin.squeeze(1)
+        
+        # For interleaved rope with full rotary_dim (D=128):
+        # cos/sin have shape [S, D], but we need [S, D//2] for the formula
+        # The standard approach: cos[i] applies to position 2i, sin[i] to position 2i+1
+        # So we extract cos/sin at even positions for interleaved format
+        
+        # Alternative interpretation for MLA:
+        # cos/sin already have the correct shape [S, D//2] = [S, 64]
+        # and the full D=128 in cos/sin means each value is duplicated
+        
+        # Let's handle both cases:
+        if cos.shape[-1] == D:
+            # cos/sin have full dimension, need to extract half
+            cos_half = cos[..., :D//2]  # [S, 64]
+            sin_half = sin[..., :D//2]  # [S, 64]
+        else:
+            # cos/sin already have half dimension
+            cos_half = cos
+            sin_half = sin
+        
+        # Reshape cos/sin for broadcasting with x
+        # x: [B, N, D], x1/x2: [B, N, D//2]
+        # cos/sin: [S, D//2] -> need to broadcast to [B, N, D//2]
+        # Since S=1 typically for decode, we can handle general S
+        S = cos_half.shape[0]
+        cos_half = cos_half.view(S, 1, D//2)  # [S, 1, D//2]
+        sin_half = sin_half.view(S, 1, D//2)  # [S, 1, D//2]
+        
+        # If B > S, we need to expand cos/sin
+        if B > S:
+            cos_half = cos_half.expand(B, 1, D//2)
+            sin_half = sin_half.expand(B, 1, D//2)
+        
+        cos_half = cos_half.squeeze(1)  # [B or S, D//2]
+        sin_half = sin_half.squeeze(1)  # [B or S, D//2]
+        
+        # Expand for broadcasting with [B, N, D//2]
+        cos_half = cos_half.unsqueeze(-2)  # [B, 1, D//2]
+        sin_half = sin_half.unsqueeze(-2)  # [B, 1, D//2]
+        
+        # Interleaved rope formula (GPT-J style)
+        x1 = x[..., ::2]  # [B, N, D//2] even indices
+        x2 = x[..., 1::2]  # [B, N, D//2] odd indices
+        
+        o1 = x1 * cos_half - x2 * sin_half
+        o2 = x2 * cos_half + x1 * sin_half
+        
+        # Stack and flatten back to interleaved format
+        output = torch.stack((o1, o2), dim=-1).flatten(-2)  # [B, N, D]
+        
+        return output
+
+    def _interleaved_rope(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        # Handle 4D tensor [B, N, S, D] for kv cache operations
+        # Use rope_single internally
+        B, N, S, D = x.shape
+        # Squeeze S dimension and process
+        x_3d = x.view(B * N, S, D).squeeze(1)  # [B*N, D] but we need [B*N, 1, D] or similar
+        
+        # Actually rope_single expects [B, N, D], let's reshape properly
+        x_3d = x.squeeze(2)  # [B, N, D]
+        
+        # Process with rope_single
+        result = self.rope_single(x_3d, cos, sin)
+        
+        # Reshape back to [B, N, S, D]
+        return result.unsqueeze(2)  # [B, N, 1, D]
+
+    def exec_kv_decode(
+        self,
+        kv_no_split: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: tuple,
+        slots: torch.Tensor,
+    ):
+        B = kv_no_split.shape[0]
+        N = self.num_kv_heads
+        S = 1
+        # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
+        if _layernorm_skip(self.kv_a_layernorm):
+            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = self._interleaved_rope(k_pe, cos, sin)
+            update_k_cache = kv_cache[1].reshape(-1, self.qk_rope_head_dim)
+            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+            update_ckv_cache = kv_cache[0].reshape(-1, self.kv_lora_rank)
+            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.reshape(-1, self.kv_lora_rank))
+            return kv_cache[1], kv_cache[0]
+        kv_no_split = kv_no_split.view(
+            B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
+        cache_mode = "PA"
+        k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+            kv_no_split,
+            self.kv_a_layernorm.weight,
+            cos,
+            sin,
+            slots.to(torch.int64),
+            kv_cache[1],
+            kv_cache[0],
+            epsilon=self.kv_a_layernorm.variance_epsilon,
+            cache_mode=cache_mode,
+        )
+        return k_pe, k_nope
+
+    def exec_kv_prefill(
+        self,
+        kv_no_split: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: tuple,
+        slots: torch.Tensor,
+    ):
+        B = kv_no_split.shape[0]
+        N = self.num_kv_heads
+        S = 1
+        # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
+        if _layernorm_skip(self.kv_a_layernorm):
+            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = self._interleaved_rope(k_pe, cos, sin)
+            update_k_cache = kv_cache[1].reshape(-1, self.qk_rope_head_dim)
+            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+            update_ckv_cache = kv_cache[0].reshape(-1, self.kv_lora_rank)
+            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.reshape(-1, self.kv_lora_rank))
+            return k_pe, k_nope
+        kv_no_split = kv_no_split.view(
+            B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
+        cache_mode = "PA"
+        _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+            kv_no_split,
+            self.kv_a_layernorm.weight,
+            cos,
+            sin,
+            slots.to(torch.int64),
+            kv_cache[1],
+            kv_cache[0],
+            epsilon=self.kv_a_layernorm.variance_epsilon,
+            cache_mode=cache_mode,
+            is_output_kv=True,
+        )
+        return k_pe, k_nope
 
     def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata):
         num_decode_tokens = attn_metadata.num_decode_tokens
