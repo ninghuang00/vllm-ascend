@@ -699,6 +699,11 @@ class PrefillMLAPreprocessResult(NamedTuple):
 def _layernorm_skip(ln):
     return ln is None or getattr(ln, 'skip', False)
 
+def hnlog(msg, tensor):
+    print("=====> hntest <==== ", msg)
+    print(tensor.shape)
+    print(tensor)
+    
 class AscendMLAImpl(MLAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -740,6 +745,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.o_proj = kwargs["o_proj"]
         self.vllm_config = get_current_vllm_config()
         self.kv_a_proj_with_mqa = kwargs.get("kv_a_proj_with_mqa")
+        self.q_norm = kwargs.get("q_norm")
+        self.k_norm = kwargs.get("k_norm")
         self.kv_a_layernorm = kwargs.get("kv_a_layernorm")
         self.q_a_layernorm = kwargs.get("q_a_layernorm")
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -915,6 +922,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             .view(-1, self.num_heads, self.qk_head_dim)
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         )
+        
+        if not _layernorm_skip(self.q_norm):
+            q_nope = self.q_norm(q_nope)
+            q_pe = self.q_norm(q_pe)
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
@@ -1218,7 +1229,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
-
+            
+            if not _layernorm_skip(self.k_norm):
+                k_nope = self.k_norm(k_nope)
+                k_pe = self.k_norm(k_pe)
+            
             actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
             common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
 
@@ -1791,6 +1806,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, -1)
         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+        
+        if not _layernorm_skip(self.q_norm):
+            prefill_q_nope = self.q_norm(prefill_q_nope)
+            prefill_q_pe = self.q_norm(prefill_q_pe)
+        if not _layernorm_skip(self.k_norm):
+            prefill_k_nope = self.k_norm(prefill_k_nope)
+            prefill_k_pe = self.k_norm(prefill_k_pe)
+        
         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
 
     def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
@@ -1800,6 +1823,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         sin = attn_metadata.decode.sin
         decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
         decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+        
         dequant_scale_q_nope = None
         if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
             decode_ql_nope, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
@@ -1809,6 +1833,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
         decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+        
         return DecodeMLAPreprocessResult(
             decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe, dequant_scale_q_nope=dequant_scale_q_nope
         )
@@ -1825,12 +1850,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         # prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
+        hnlog("hidden_states", hidden_states)
         if self.fused_qkv_a_proj is not None:
             weight_prefetch_method = get_weight_prefetch_method()
             weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
                 inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
             )
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            hnlog("qkv_lora", qkv_lora)
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -1838,6 +1865,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             q_c = self.q_a_layernorm(q_c)  # type: ignore[misc]
             # allgather need contiguous data
             kv_no_split = kv_no_split.contiguous()
+            hnlog("q_c", q_c)
+            hnlog("kv_no_split", kv_no_split)
         else:
             q_c = hidden_states
             kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]  # type: ignore[misc]
@@ -1935,6 +1964,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
                 layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
             )
+        
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             output_decode = self._forward_decode(
