@@ -1,3 +1,4 @@
+build_manual/
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/
