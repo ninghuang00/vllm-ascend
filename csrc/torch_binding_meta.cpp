@@ -283,6 +283,29 @@ std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
         return {output, add_out};
     }
 
+    std::tuple<at::Tensor, at::Tensor> kv_rope_cache_meta(
+        const at::Tensor &kv,
+        const at::Tensor &cos,
+        const at::Tensor &sin,
+        const at::Tensor &slots,
+        at::Tensor &k_cache,
+        at::Tensor &ckv_cache,
+        c10::optional<bool> is_output_kv)
+    {
+        auto num_tokens = kv.size(0);
+        auto rope_dim = cos.size(-1);
+        auto kv_lora_rank = kv.size(-1) - rope_dim;
+        bool output_kv = is_output_kv.value_or(false);
+
+        if (output_kv) {
+            at::Tensor k_pe = at::empty({num_tokens, rope_dim}, kv.options().device(at::kMeta));
+            at::Tensor k_nope = at::empty({num_tokens, kv_lora_rank}, kv.options().device(at::kMeta));
+            return {k_pe, k_nope};
+        }
+        return {at::empty({0}, kv.options().device(at::kMeta)),
+                at::empty({0}, kv.options().device(at::kMeta))};
+    }
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -316,5 +339,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // matmul allreduce add rmsnorm
     ops.impl("matmul_allreduce_add_rmsnorm", &vllm_ascend::meta::matmul_allreduce_add_rmsnorm_meta);
+    // kv rope cache
+    ops.impl("kv_rope_cache", &vllm_ascend::meta::kv_rope_cache_meta);
 }
 }

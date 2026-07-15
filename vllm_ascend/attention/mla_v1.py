@@ -1117,12 +1117,19 @@ class AscendMLAImpl(MLAAttentionImpl):
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         if _layernorm_skip(self.kv_a_layernorm):
-            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
-            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
-            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
-            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+            rope_dim = self.qk_rope_head_dim
+            kv_lora_rank = self.kv_lora_rank
+            kv_flat = kv_no_split.view(B, -1).contiguous()
+            cos_flat = cos.view(B, -1).contiguous()
+            sin_flat = sin.view(B, -1).contiguous()
+            slots_flat = slots.to(torch.int64).flatten()
+            k_cache_flat = kv_cache[1].view(-1, rope_dim)
+            ckv_cache_flat = kv_cache[0].view(-1, kv_lora_rank)
+            torch.ops._C_ascend.kv_rope_cache(
+                kv_flat, cos_flat, sin_flat, slots_flat,
+                k_cache_flat, ckv_cache_flat,
+                is_output_kv=False,
+            )
             return kv_cache[1], kv_cache[0]
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
@@ -1153,12 +1160,19 @@ class AscendMLAImpl(MLAAttentionImpl):
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         if _layernorm_skip(self.kv_a_layernorm):
-            k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-            update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
-            torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
-            update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
-            torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
+            rope_dim = self.qk_rope_head_dim
+            kv_lora_rank = self.kv_lora_rank
+            kv_flat = kv_no_split.view(B, -1).contiguous()
+            cos_flat = cos.view(B, -1).contiguous()
+            sin_flat = sin.view(B, -1).contiguous()
+            slots_flat = slots.to(torch.int64).flatten()
+            k_cache_flat = kv_cache[1].view(-1, rope_dim)
+            ckv_cache_flat = kv_cache[0].view(-1, kv_lora_rank)
+            k_pe, k_nope = torch.ops._C_ascend.kv_rope_cache(
+                kv_flat, cos_flat, sin_flat, slots_flat,
+                k_cache_flat, ckv_cache_flat,
+                is_output_kv=True,
+            )
             return k_pe, k_nope
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)

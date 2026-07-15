@@ -168,4 +168,21 @@ namespace vllm_ascend {
         void* gm_tiling_data,
         const uint32_t block_dim
     );
+
+    extern void kv_rope_cache_impl(
+        AscendType type,
+        void *stream,
+        void *kv,
+        void *cos,
+        void *sin,
+        void *slots,
+        void *k_cache,
+        void *ckv_cache,
+        void *k_pe_out,
+        void *k_nope_out,
+        const int kvLoraRank,
+        const int ropeDim,
+        const int64_t numTokens,
+        const bool isOutputKv
+    );
 }

@@ -878,6 +878,77 @@ std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm(
         return {output, add_out};
     }
 
+std::tuple<at::Tensor, at::Tensor> kv_rope_cache(
+    const at::Tensor &kv,
+    const at::Tensor &cos,
+    const at::Tensor &sin,
+    const at::Tensor &slots,
+    at::Tensor &k_cache,
+    at::Tensor &ckv_cache,
+    c10::optional<bool> is_output_kv)
+{
+    at::ScalarType scalar_type = kv.scalar_type();
+    TORCH_CHECK(scalar_type == torch::kHalf || scalar_type == torch::kBFloat16,
+                "kv_rope_cache: only support half and bf16");
+
+    int64_t num_tokens = kv.size(0);
+    int kv_lora_rank = 0;
+    int rope_dim = 0;
+
+    auto kv_last_dim = kv.size(-1);
+    auto cos_last_dim = cos.size(-1);
+    rope_dim = static_cast<int>(cos_last_dim);
+    kv_lora_rank = static_cast<int>(kv_last_dim) - rope_dim;
+
+    TORCH_CHECK(kv_lora_rank > 0, "kv_lora_rank must be positive, got ", kv_lora_rank);
+    TORCH_CHECK(rope_dim > 0, "rope_dim must be positive, got ", rope_dim);
+    TORCH_CHECK(rope_dim % 2 == 0, "rope_dim must be even, got ", rope_dim);
+
+    bool output_kv = is_output_kv.value_or(false);
+
+    at::Tensor k_pe_out;
+    at::Tensor k_nope_out;
+    if (output_kv) {
+        k_pe_out = at::empty({num_tokens, rope_dim}, kv.options());
+        k_nope_out = at::empty({num_tokens, kv_lora_rank}, kv.options());
+    } else {
+        k_pe_out = at::empty({0}, kv.options());
+        k_nope_out = at::empty({0}, kv.options());
+    }
+
+    void *kv_ptr = kv.data_ptr();
+    void *cos_ptr = cos.data_ptr();
+    void *sin_ptr = sin.data_ptr();
+    void *slots_ptr = slots.data_ptr();
+    void *k_cache_ptr = k_cache.data_ptr();
+    void *ckv_cache_ptr = ckv_cache.data_ptr();
+    void *k_pe_out_ptr = k_pe_out.data_ptr();
+    void *k_nope_out_ptr = k_nope_out.data_ptr();
+
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("kv_rope_cache");
+
+    cmd.SetCustomHandler([scalar_type, stream,
+                          kv_ptr, cos_ptr, sin_ptr, slots_ptr,
+                          k_cache_ptr, ckv_cache_ptr,
+                          k_pe_out_ptr, k_nope_out_ptr,
+                          kv_lora_rank, rope_dim, num_tokens, output_kv]() -> int {
+        auto dtype = get_dtype_from_torch(scalar_type);
+        kv_rope_cache_impl(dtype, stream,
+                           kv_ptr, cos_ptr, sin_ptr, slots_ptr,
+                           k_cache_ptr, ckv_cache_ptr,
+                           k_pe_out_ptr, k_nope_out_ptr,
+                           kv_lora_rank, rope_dim,
+                           num_tokens, output_kv);
+        return 0;
+    });
+    cmd.Run();
+
+    return {k_pe_out, k_nope_out};
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> get_dispatch_layout(const at::Tensor& topk_idx, int64_t num_experts,
                                                                    int64_t num_ranks) {
     TORCH_BIND_ASSERT(topk_idx.dim() == 2);
@@ -1257,4 +1328,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "num_ranks) -> Tensor");
     ops.impl("combine_prefill", torch::kPrivateUse1,
              &vllm_ascend::combine_prefill);
+
+    ops.def(
+        "kv_rope_cache(Tensor kv, Tensor cos, Tensor sin, Tensor slots, "
+        "Tensor! k_cache, Tensor! ckv_cache, bool? is_output_kv=False) -> "
+        "(Tensor k_pe, Tensor k_nope)");
+    ops.impl("kv_rope_cache", torch::kPrivateUse1,
+             &vllm_ascend::kv_rope_cache);
 }
