@@ -169,7 +169,7 @@ namespace vllm_ascend {
         const uint32_t block_dim
     );
 
-    extern void kv_rope_cache_impl(
+    extern void kv_rope_cache_v2_impl(
         AscendType type,
         void *stream,
         void *kv,
@@ -180,9 +180,7 @@ namespace vllm_ascend {
         void *ckv_cache,
         void *k_pe_out,
         void *k_nope_out,
-        const int kvLoraRank,
-        const int ropeDim,
-        const int64_t numTokens,
-        const bool isOutputKv
+        int64_t numTokens,
+        bool isOutputKv
     );
 }

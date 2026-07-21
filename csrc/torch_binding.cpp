@@ -892,17 +892,11 @@ std::tuple<at::Tensor, at::Tensor> kv_rope_cache(
                 "kv_rope_cache: only support half and bf16");
 
     int64_t num_tokens = kv.size(0);
-    int kv_lora_rank = 0;
-    int rope_dim = 0;
+    int kv_lora_rank = static_cast<int>(kv.size(-1)) - static_cast<int>(cos.size(-1));
+    int rope_dim = static_cast<int>(cos.size(-1));
 
-    auto kv_last_dim = kv.size(-1);
-    auto cos_last_dim = cos.size(-1);
-    rope_dim = static_cast<int>(cos_last_dim);
-    kv_lora_rank = static_cast<int>(kv_last_dim) - rope_dim;
-
-    TORCH_CHECK(kv_lora_rank > 0, "kv_lora_rank must be positive, got ", kv_lora_rank);
-    TORCH_CHECK(rope_dim > 0, "rope_dim must be positive, got ", rope_dim);
-    TORCH_CHECK(rope_dim % 2 == 0, "rope_dim must be even, got ", rope_dim);
+    TORCH_CHECK(kv_lora_rank == 512, "kv_lora_rank must be 512, got ", kv_lora_rank);
+    TORCH_CHECK(rope_dim == 64, "rope_dim must be 64, got ", rope_dim);
 
     bool output_kv = is_output_kv.value_or(false);
 
@@ -934,14 +928,13 @@ std::tuple<at::Tensor, at::Tensor> kv_rope_cache(
                           kv_ptr, cos_ptr, sin_ptr, slots_ptr,
                           k_cache_ptr, ckv_cache_ptr,
                           k_pe_out_ptr, k_nope_out_ptr,
-                          kv_lora_rank, rope_dim, num_tokens, output_kv]() -> int {
+                          num_tokens, output_kv]() -> int {
         auto dtype = get_dtype_from_torch(scalar_type);
-        kv_rope_cache_impl(dtype, stream,
-                           kv_ptr, cos_ptr, sin_ptr, slots_ptr,
-                           k_cache_ptr, ckv_cache_ptr,
-                           k_pe_out_ptr, k_nope_out_ptr,
-                           kv_lora_rank, rope_dim,
-                           num_tokens, output_kv);
+        kv_rope_cache_v2_impl(dtype, stream,
+                              kv_ptr, cos_ptr, sin_ptr, slots_ptr,
+                              k_cache_ptr, ckv_cache_ptr,
+                              k_pe_out_ptr, k_nope_out_ptr,
+                              num_tokens, output_kv);
         return 0;
     });
     cmd.Run();
