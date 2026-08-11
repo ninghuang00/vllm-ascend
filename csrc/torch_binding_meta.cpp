@@ -193,6 +193,13 @@ void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor
     return;
 }
 
+void kv_rope_cache(
+    const at::Tensor &kv, const at::Tensor &cos, const at::Tensor &sin,
+    const at::Tensor &index, at::Tensor &k_cache, at::Tensor &v_cache,
+    at::Tensor &k_rope_out, at::Tensor &c_kv_out, bool is_output_kv) {
+    return;
+}
+
 at::Tensor& dispatch_ffn_combine_meta(
     const at::Tensor& x,
     const at::Tensor& weight1,
@@ -308,6 +315,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
     // batch_matmul_transpose
     ops.impl("batch_matmul_transpose", &vllm_ascend::meta::batch_matmul_transpose);
+    // kv_rope_cache meta
+    ops.impl("kv_rope_cache", &vllm_ascend::meta::kv_rope_cache);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention

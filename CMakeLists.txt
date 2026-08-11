@@ -59,6 +59,7 @@ set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kv_rope_cache/op_kernel/kv_rope_cache_kernel.cpp
 )
 
 set(VLLM_ASCEND_CUSTOM_OP_EXCLUDE

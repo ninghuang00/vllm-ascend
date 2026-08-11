@@ -29,6 +29,7 @@
 #include "utils.h"
 #include "mla_preprocess/op_host/mla_preprocess.h"
 #include "batch_matmul_transpose/op_host/batch_matmul_transpose.h"
+#include "kv_rope_cache/op_host/kv_rope_cache.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 
 #include <c10/core/Device.h>
@@ -724,6 +725,46 @@ void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor
     return;
 }
 
+void kv_rope_cache(
+    const at::Tensor& kv,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    const at::Tensor& index,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    at::Tensor& k_rope_out,
+    at::Tensor& c_kv_out,
+    bool is_output_kv) {
+    auto t = kv_rope_cache_op::kv_rope_cache_tiling(kv, k_cache, v_cache, is_output_kv);
+
+    void* gm_kv = kv.data_ptr();
+    void* gm_cos = cos.data_ptr();
+    void* gm_sin = sin.data_ptr();
+    void* gm_index = index.data_ptr();
+    void* gm_k_cache = k_cache.data_ptr();
+    void* gm_v_cache = v_cache.data_ptr();
+    void* gm_k_rope_out = (is_output_kv && k_rope_out.numel() > 0)
+                              ? k_rope_out.data_ptr() : nullptr;
+    void* gm_c_kv_out = (is_output_kv && c_kv_out.numel() > 0)
+                            ? c_kv_out.data_ptr() : nullptr;
+
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("kv_rope_cache");
+    cmd.SetCustomHandler(
+        [stream, gm_kv, gm_cos, gm_sin, gm_index, gm_k_cache, gm_v_cache,
+         gm_k_rope_out, gm_c_kv_out, t]() -> int {
+            vllm_ascend::kv_rope_cache_impl(
+                stream, gm_kv, gm_cos, gm_sin, gm_index, gm_k_cache, gm_v_cache,
+                gm_k_rope_out, gm_c_kv_out,
+                t.batchSize, t.seqLength, t.numHead, t.blockFactor, t.ubFactor,
+                t.numBlocks, t.isOutputKv, t.rmsNormLength, t.ropeLength,
+                t.numBlocks_u);
+            return 0;
+        });
+    cmd.Run();
+}
+
 at::Tensor& dispatch_ffn_combine(
     const at::Tensor& x,
     const at::Tensor& weight1,
@@ -1177,7 +1218,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "batch_matmul_transpose(Tensor tensor_a, Tensor tensor_b, Tensor tensor_c, str? format_mode=None, str? quant_mode=None) -> ()");    
     ops.impl("batch_matmul_transpose", torch::kPrivateUse1, &vllm_ascend::batch_matmul_transpose);
 
-    ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");    
+    // kv_rope_cache: fused RoPE + paged-scatter for MLA WITHOUT RMSNorm
+    // (qk_latent_layernorm=False). Fully in-place (no returns, no host alloc)
+    // so it is ACL-graph-capturable. k_rope_out/c_kv_out are caller-pre-
+    // allocated (prefill) or empty (decode, kernel skips the ND write).
+    ops.def(
+        "kv_rope_cache(Tensor kv, Tensor cos, Tensor sin, Tensor index,"
+        "              Tensor! k_cache, Tensor! v_cache,"
+        "              Tensor! k_rope_out, Tensor! c_kv_out,"
+        "              bool is_output_kv=False) -> ()");
+    ops.impl("kv_rope_cache", torch::kPrivateUse1, &vllm_ascend::kv_rope_cache);
+
+    ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
 
     ops.def(

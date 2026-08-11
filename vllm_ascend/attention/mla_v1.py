@@ -778,6 +778,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.kv_a_proj_with_mqa = kwargs.get('kv_a_proj_with_mqa', None)
         self.kv_a_layernorm = kwargs.get('kv_a_layernorm', None)
         self.q_a_layernorm = kwargs.get('q_a_layernorm', None)
+        self.qk_latent_layernorm = getattr(
+            self.vllm_config.model_config.hf_text_config,
+            'qk_latent_layernorm', True)
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         ascend_config = get_ascend_config()
@@ -1085,6 +1088,16 @@ class AscendMLAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
+        if not self.qk_latent_layernorm:
+            # qk_latent_layernorm=False: fused RoPE + paged-scatter WITHOUT
+            # RMSNorm (single kernel, in-place on the paged cache). Decode:
+            # is_output_kv=False -> kernel only writes the paged caches.
+            _empty = torch.empty(0, dtype=kv_no_split.dtype,
+                                 device=kv_no_split.device)
+            torch.ops._C_ascend.kv_rope_cache(
+                kv_no_split, cos, sin, slots.to(torch.int64),
+                kv_cache[1], kv_cache[0], _empty, _empty, False)
+            return kv_cache[1], kv_cache[0]
         cache_mode = "PA"
         k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
             kv_no_split,
@@ -1113,6 +1126,19 @@ class AscendMLAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
+        if not self.qk_latent_layernorm:
+            # qk_latent_layernorm=False: fused RoPE + paged-scatter, no RMSNorm.
+            # Pre-allocate k_pe/c_kv outputs (prefill needs them for attention
+            # + kv_b_proj); the op writes them in-place.
+            B = kv_no_split.shape[0]
+            k_pe = torch.empty(B, self.num_kv_heads, 1, self.qk_rope_head_dim,
+                               dtype=kv_no_split.dtype, device=kv_no_split.device)
+            c_kv = torch.empty(B, self.num_kv_heads, 1, self.kv_lora_rank,
+                               dtype=kv_no_split.dtype, device=kv_no_split.device)
+            torch.ops._C_ascend.kv_rope_cache(
+                kv_no_split, cos, sin, slots.to(torch.int64),
+                kv_cache[1], kv_cache[0], k_pe, c_kv, True)
+            return k_pe, c_kv
         cache_mode = "PA"
         _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
             kv_no_split,
@@ -1342,7 +1368,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
+            if self.qk_latent_layernorm:
+                q_c = self.q_a_layernorm(q_c)
             # allgather need contiguous data
             kv_no_split = kv_no_split.contiguous()
         else:
