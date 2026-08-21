@@ -47,9 +47,9 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
 
         experimental_config = torch_npu.profiler._ExperimentalConfig(
-            export_type=torch_npu.profiler.ExportType.Text,
+            export_type=torch_npu.profiler.ExportType.Db,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-            msprof_tx=False,
+            msprof_tx=True,
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,

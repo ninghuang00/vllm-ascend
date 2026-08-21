@@ -395,6 +395,9 @@ def zero_experts_compute(
     zero_expert_type: str,
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Default: special experts (idx >= num_experts) contribute nothing.
+    # The "zero" type relies on this default; "identity" overwrites it below.
+    result = torch.zeros_like(hidden_states)
     if zero_expert_type == "identity":
         zero_expert_mask = expert_indices < num_experts
         zero_expert_scales = expert_scales.clone()

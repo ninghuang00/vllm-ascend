@@ -80,6 +80,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 head_size=head_size,
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
+                qk_rope_head_dim=attn_module.qk_rope_head_dim,
             )
 
     return kv_cache_spec

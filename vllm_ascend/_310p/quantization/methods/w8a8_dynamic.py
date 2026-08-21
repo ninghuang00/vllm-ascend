@@ -151,7 +151,7 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
             ),
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
-            final_hidden_states += zero_expert_result
+            final_hidden_states.routed_out += zero_expert_result
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

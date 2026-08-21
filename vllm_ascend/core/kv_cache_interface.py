@@ -30,14 +30,25 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # main-cache property here; indexer-specific C8 properties belong to the
     # indexer spec.
     cache_sparse_c8: bool = False
+    # MLA on Ascend always indexes KV pages by block stride, enabling
+    # page-size padding for hybrid models (MLA + GDN/mamba).
+    indexes_kv_by_block_stride: bool = True
+    # Size of the RoPE portion of head_size; the remainder is kv_lora_rank.
+    # Ascend MLA stores K and rope in separate cache tensors, so page_size_bytes
+    # for alignment purposes uses only the K part.
+    qk_rope_head_dim: int = 0
 
     @property
     def page_size_bytes(self) -> int:
-        return (
+        real = (
             self.block_size
             * self.num_kv_heads
             * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
         )
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= real
+            return self.page_size_padded
+        return real
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -75,6 +86,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
+            qk_rope_head_dim=specs[0].qk_rope_head_dim,
+            page_size_padded=specs[0].page_size_padded,
+            indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:

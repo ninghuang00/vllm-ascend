@@ -191,4 +191,5 @@ class DSAAttention(nn.Module, AttentionLayerBase):
             model_version="deepseek_v4",
             compress_ratio=self.compress_ratio,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )

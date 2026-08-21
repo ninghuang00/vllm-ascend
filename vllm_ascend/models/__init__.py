@@ -12,3 +12,19 @@ def register_model():
     ModelRegistry.register_model(
         "LlamaForCausalLMVwnEagle3", "vllm_ascend.models.llama_eagle3_vwn:Eagle3VwnLlamaForCausalLM"
     )
+    ModelRegistry.register_model(
+        "Qwen3MoePlusPlusForCausalLM",
+        "vllm_ascend.models.qwen3_moe_plus_plus:Qwen3MoePlusPlusForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "Qwen3MoePlusPlusRefineForCausalLM",
+        "vllm_ascend.models.qwen3_moe_plus_plus_refine:Qwen3MoePlusPlusRefineForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "Qwen3_6MLAForConditionalGeneration",
+        "vllm_ascend.models.qwen3_6_mla:Qwen3_6MLAForConditionalGeneration",
+    )
+    ModelRegistry.register_model(
+        "Qwen3_6MLAForCausalLM",
+        "vllm_ascend.models.qwen3_6_mla:Qwen3_6MLAForCausalLM",
+    )
