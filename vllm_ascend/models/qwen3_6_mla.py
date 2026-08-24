@@ -66,7 +66,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
 # ops.fused_moe → experts_selector → device_op.
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
-from vllm_ascend.utils import maybe_trans_nz
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, maybe_trans_nz
 
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_5 import (
@@ -635,6 +635,118 @@ class Qwen3_6MLAImplMixin:
 
         return attn_output
 
+    # ── chunked prefill context (override) ───────────────────────────
+    # The base class _compute_prefill_context uses separate query_rope /
+    # key_rope when head_padding == 0, leaving query = q_nope (192) which
+    # violates the FIA constraint (query head_dim >= value head_dim 256).
+    # Override to always concatenate q_pe + q_nope = 256, matching the fix
+    # already applied in _forward_prefill above.
+    def _compute_prefill_context(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: tuple[torch.Tensor],
+        rope_dim: int,
+        attn_metadata,
+        prefix_output: torch.Tensor,
+        prefix_lse: torch.Tensor,
+    ):
+        from vllm_ascend.device.device_op import DeviceOperator
+
+        assert len(kv_c_and_k_pe_cache) > 1
+        prefill_metadata = attn_metadata.prefill
+        if prefill_metadata is None or prefill_metadata.chunked_context is None:
+            return prefix_output, prefix_lse
+
+        iters = len(prefill_metadata.chunked_context.seq_tot)
+        cache_kv_c = kv_c_and_k_pe_cache[0]
+        cache_k_pe = kv_c_and_k_pe_cache[1]
+        num_heads = cache_k_pe.size(2)
+        latent_kv_dim = kv_c_and_k_pe_cache[0].size(-1)
+
+        actual_seq_lengths_q = prefill_metadata.actual_seq_lengths_q
+
+        if iters == 0:
+            return prefix_output, prefix_lse
+
+        num_tokens = q_nope.size(0)
+        D = self.v_head_dim
+        H = self.num_heads
+
+        if prefix_lse.dim() == 2:
+            prefix_lse = prefix_lse.transpose(0, 1).unsqueeze(-1)
+        prefix_output = prefix_output.to(torch.float32)
+        prefix_lse = prefix_lse.to(torch.float32)
+        out_list = [prefix_output.reshape(num_tokens * H, D)]
+        lse_list = [prefix_lse.reshape(num_tokens * H)]
+
+        # Force concatenated query (q_pe + q_nope = 256 >= v_head_dim 256)
+        query = torch.cat((q_pe, q_nope), dim=-1)
+
+        common_kwargs = {
+            "num_heads": self.num_heads,
+            "num_key_value_heads": self.num_heads,
+            "input_layout": "TND",
+            "atten_mask": None,
+            "sparse_mode": 0,
+            "scale": self.scale,
+            "antiquant_mode": 0,
+            "antiquant_scale": None,
+            "softmax_lse_flag": True,
+            "actual_seq_lengths": actual_seq_lengths_q,
+        }
+
+        for i in range(iters):
+            toks = prefill_metadata.chunked_context.seq_tot[i]
+            context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
+            kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device)
+            k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_pe.dtype, device=q_pe.device)
+
+            DeviceOperator.kv_cache_load(
+                cache_kv_c,
+                cache_k_pe,
+                prefill_metadata.block_table,
+                context_seq_len_npu,
+                prefill_metadata.chunked_context.starts[i],
+                key=kv_c_normed,
+                value=k_pe,
+            )
+            kv_c_normed, k_pe = self._reorg_kvcache(
+                kv_c_normed,
+                k_pe,
+                chunked_context=prefill_metadata.chunked_context,
+                chunk_idx=i,
+                toks=toks,
+            )
+            kv_c_normed = kv_c_normed.squeeze()
+            if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
+                kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
+                    torch.bfloat16
+                )
+            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+
+            actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
+            common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
+
+            # Force concatenated key (k_pe + k_nope = 256 >= v_head_dim 256)
+            key = torch.cat((k_pe, k_nope), dim=-1)
+
+            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                query, key.contiguous(), v.contiguous(), **common_kwargs
+            )
+
+            if chunk_lse.dim() == 2:
+                chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
+            chunk_out = chunk_out.to(torch.float32)
+            chunk_lse = chunk_lse.to(torch.float32)
+            out_list.append(chunk_out.reshape(num_tokens * H, D))
+            lse_list.append(chunk_lse.reshape(num_tokens * H))
+
+        output_final, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
+        return output_final.view(num_tokens, H, D), None
+
     # ── forward with gate ─────────────────────────────────────────────
     def forward(
         self,
@@ -1054,19 +1166,19 @@ class Qwen3_6MLADecoderLayer(nn.Module):
 
         stream = torch_npu.npu.current_stream()
         if self.layer_type == "full_attention":
-            torch_npu.npu.mstx.mark("full_attention start", stream)
+            # torch_npu.npu.mstx.mark("full_attention start", stream)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
             )
-            torch_npu.npu.mstx.mark("full_attention end", stream)
+            # torch_npu.npu.mstx.mark("full_attention end", stream)
         else:
-            torch_npu.npu.mstx.mark("linear_attention start", stream)
+            # torch_npu.npu.mstx.mark("linear_attention start", stream)
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 **kwargs,
             )
-            torch_npu.npu.mstx.mark("linear_attention end", stream)
+            # torch_npu.npu.mstx.mark("linear_attention end", stream)
 
             if self.layer_idx in (0, 1) and not getattr(self, f'_dbg_postgdn_l{self.layer_idx}', False) and hidden_states.shape[0] <= 128:
                 setattr(self, f'_dbg_postgdn_l{self.layer_idx}', True)
