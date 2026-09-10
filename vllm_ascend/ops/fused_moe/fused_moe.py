@@ -314,8 +314,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 lora_context=getattr(layer, "_ascend_moe_lora_context", None),
             )
         )
-        if zero_expert_num > 0 and zero_expert_type is not None:
-            final_hidden_states += zero_expert_result
+        if zero_expert_result is not None:
+            final_hidden_states.routed_out = (
+                final_hidden_states.routed_out + zero_expert_result
+            )
         return final_hidden_states
 
 

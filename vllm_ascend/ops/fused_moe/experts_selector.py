@@ -394,7 +394,7 @@ def zero_experts_compute(
     num_experts: int,
     zero_expert_type: str,
     hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     if zero_expert_type == "identity":
         zero_expert_mask = expert_indices < num_experts
         zero_expert_scales = expert_scales.clone()
@@ -404,6 +404,10 @@ def zero_experts_compute(
         zero_expert_scales = zero_expert_scales.unsqueeze(2)
         result = hidden_states * zero_expert_scales
         result = result.sum(dim=1)
+    elif zero_expert_type == "zero":
+        result = None
+    else:
+        raise ValueError(f"Unsupported zero_expert_type: {zero_expert_type}")
 
     normal_expert_mask = expert_indices >= num_experts
     expert_indices = torch.where(normal_expert_mask, 0, expert_indices)
