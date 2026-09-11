@@ -222,6 +222,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if capturer is not None:
                 capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
 
+        zero_expert_result = None
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
