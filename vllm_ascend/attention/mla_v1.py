@@ -1,11 +1,25 @@
 from dataclasses import dataclass
+import os
 from typing import (TYPE_CHECKING, ClassVar, NamedTuple, Optional, Tuple, Type,
-                    TypeVar)
+                     TypeVar)
 
 import numpy as np
 import torch
 import torch_npu
 from torch import nn
+
+# Load custom kv_rope_cache kernel (RoPE + scatter to kCache, no RmsNorm)
+_KV_ROPE_CACHE_SO = os.environ.get(
+    "KV_ROPE_CACHE_SO",
+    "/opt/data/h00521009/code/OpenPangu-7B-mla-vllm/kv_rope_cache_pa/build/libkv_rope_cache_ops.so")
+_KV_ROPE_CACHE_AVAILABLE = False
+if os.path.exists(_KV_ROPE_CACHE_SO):
+    try:
+        torch.ops.load_library(_KV_ROPE_CACHE_SO)
+        _KV_ROPE_CACHE_AVAILABLE = True
+    except Exception:
+        pass
+
 from vllm.attention.backends.abstract import AttentionBackend, MLAAttentionImpl
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -1087,9 +1101,16 @@ class AscendMLAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         if _layernorm_skip(self.kv_a_layernorm):
                 k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-                update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
-                torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+                if _KV_ROPE_CACHE_AVAILABLE:
+                    k_pe_flat = k_pe.reshape(-1, self.qk_rope_head_dim)
+                    cos_flat = cos.reshape(-1, self.qk_rope_head_dim) if cos.numel() > self.qk_rope_head_dim else cos.reshape(1, -1)
+                    sin_flat = sin.reshape(-1, self.qk_rope_head_dim) if sin.numel() > self.qk_rope_head_dim else sin.reshape(1, -1)
+                    k_cache_flat = kv_cache[1].view(-1, self.qk_rope_head_dim)
+                    torch.ops.npu.kv_rope_cache(k_pe_flat, cos_flat, sin_flat, slots.to(torch.int64), k_cache_flat)
+                else:
+                    k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+                    update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+                    torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
                 update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
                 torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
                 return kv_cache[1], kv_cache[0]
@@ -1123,12 +1144,20 @@ class AscendMLAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         if _layernorm_skip(self.kv_a_layernorm):
                 k_nope, k_pe = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-                update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
-                torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
+                if _KV_ROPE_CACHE_AVAILABLE:
+                    k_pe_flat = k_pe.reshape(-1, self.qk_rope_head_dim)
+                    cos_flat = cos.reshape(-1, self.qk_rope_head_dim) if cos.numel() > self.qk_rope_head_dim else cos.reshape(1, -1)
+                    sin_flat = sin.reshape(-1, self.qk_rope_head_dim) if sin.numel() > self.qk_rope_head_dim else sin.reshape(1, -1)
+                    k_cache_flat = kv_cache[1].view(-1, self.qk_rope_head_dim)
+                    torch.ops.npu.kv_rope_cache(k_pe_flat, cos_flat, sin_flat, slots.to(torch.int64), k_cache_flat)
+                else:
+                    k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+                    update_k_cache = kv_cache[1].view(-1, self.qk_rope_head_dim)
+                    torch_npu.npu_scatter_nd_update_(update_k_cache, slots.to(torch.int64).unsqueeze(-1), k_pe)
                 update_ckv_cache = kv_cache[0].view(-1, self.kv_lora_rank)
                 torch_npu.npu_scatter_nd_update_(update_ckv_cache, slots.to(torch.int64).unsqueeze(-1), k_nope.view(-1, self.kv_lora_rank))
-                return k_pe, k_nope
+                k_pe_out = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+                return k_pe_out, k_nope
         kv_no_split = kv_no_split.view(
             B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
