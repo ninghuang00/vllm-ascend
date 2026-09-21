@@ -4057,7 +4057,9 @@ class NPUModelRunner(GPUModelRunner):
                     or self.hybrid_with_attn_and_mamba
                     or "cache_only_layers" in layer_name
                     or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
-                ) and layer_name not in kv_cache_raw_tensors:
+                ) and layer_name not in kv_cache_raw_tensors and not isinstance(
+                    layer_kv_cache_spec.get(layer_name), AscendSFAIndexerCacheSpec
+                ):
                     # Check if shared_by contains both MambaSpec and HiddenStateCacheSpec.
                     # If so, they must use separate physical memory to avoid corruption:
                     # writing float32 ssm_state data into the shared buffer overwrites
@@ -4087,12 +4089,22 @@ class NPUModelRunner(GPUModelRunner):
                             tensor_hs = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
                             tensor_hs = self._align_memory(tensor_hs, alignment)[: kv_cache_tensor.size]
                         for layer_name_inner in kv_cache_tensor.shared_by:
+                            # shared the kvcache for all shared layers, EXCEPT the
+                            # SFA indexer layers which carry a different (K-only
+                            # 1-tuple) physical layout and are allocated by their
+                            # dedicated branch below.
+                            if isinstance(layer_kv_cache_spec.get(layer_name_inner),
+                                          AscendSFAIndexerCacheSpec):
+                                continue
                             if is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name_inner)):
                                 kv_cache_raw_tensors[layer_name_inner] = tensor_hs
                             else:
                                 kv_cache_raw_tensors[layer_name_inner] = tensor
                     else:
                         for layer_name_inner in kv_cache_tensor.shared_by:
+                            if isinstance(layer_kv_cache_spec.get(layer_name_inner),
+                                          AscendSFAIndexerCacheSpec):
+                                continue
                             kv_cache_raw_tensors[layer_name_inner] = tensor
 
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
@@ -4146,7 +4158,13 @@ class NPUModelRunner(GPUModelRunner):
                         raw_cache = (k_tensor,)
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
-                        kv_cache_raw_tensors[layer_name_inner] = raw_cache
+                        # Only assign the indexer raw tensor to indexer cache
+                        # layers. MLA layers in the same uniform-type group have
+                        # a different physical layout and must be allocated
+                        # separately by the attn branch below; without this guard
+                        # the indexer 1-tuple overwrites the MLA entry.
+                        if isinstance(layer_kv_cache_spec.get(layer_name_inner), AscendSFAIndexerCacheSpec):
+                            kv_cache_raw_tensors[layer_name_inner] = raw_cache
                 elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors and not use_mamba:
                     # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
                     # v cache tensor (rope cache tensor in mla) separately to support prefill disaggregation,
@@ -4351,8 +4369,15 @@ class NPUModelRunner(GPUModelRunner):
                         raw_scale_tensor = None
                         sum_page_size_bytes = raw_k_tensor.numel()
 
-                    assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
-                    num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
+                    # Use the REAL (unpadded) indexer page for the consistency
+                    # check / num_blocks: the indexer tensor is sized by the
+                    # real head_size (index_head_dim), while page_size_bytes is
+                    # padded to the MLA page only for cross-group uniformity
+                    # (get_uniform_page_size). Using page_size_bytes here would
+                    # fail since MLA(576) and indexer(128) page units differ.
+                    real_page_bytes = current_kv_cache_spec.real_page_size_bytes
+                    assert sum_page_size_bytes % real_page_bytes == 0
+                    num_blocks = sum_page_size_bytes // real_page_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
@@ -4399,7 +4424,14 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         kv_caches[layer_name] = reshaped_tensors
                         continue
-                    if self.use_sparse and "cache_only_layers" not in layer_name:
+                    if (
+                        self.use_sparse
+                        and not self.hybrid_with_attn_and_mamba
+                        and "cache_only_layers" not in layer_name
+                    ):
+                        # Sparse (SFA) MLA on a non-hybrid model (e.g. DeepSeek
+                        # V4): the layer owns a separate (k, v) tuple allocated
+                        # by the dedicated attn allocation branch.
                         raw_cache = kv_cache_raw_tensors[layer_name]
                         assert isinstance(raw_cache, tuple)
                         if current_sparse_sfa_c8:
@@ -4831,15 +4863,6 @@ class NPUModelRunner(GPUModelRunner):
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                 continue
-            elif self.use_compress:
-                # Skip modules that don't need KV cache (eg encoder-only attention)
-                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
-            elif isinstance(attn_module, Attention):
-                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
-                    attn_layer_names.add(layer_name)
-
             elif isinstance(attn_module, MLAAttention):
                 if self.use_sparse:
                     impl = attn_module.impl
@@ -4866,6 +4889,7 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=cache_sparse_sfa_c8,
                         store_on_host=self.sparse_kv_offload_enabled,
+                        qk_rope_head_dim=self.model_config.hf_text_config.qk_rope_head_dim,
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
@@ -4879,8 +4903,19 @@ class NPUModelRunner(GPUModelRunner):
                         head_size=head_size,
                         dtype=dtype,
                         cache_dtype_str=cache_dtype_str,
+                        qk_rope_head_dim=attn_module.qk_rope_head_dim,
                     )
                     attn_layer_names.add(layer_name)
+
+            elif isinstance(attn_module, Attention):
+                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    kv_cache_spec[layer_name] = spec
+                    attn_layer_names.add(layer_name)
+
+            elif self.use_compress:
+                # Skip modules that don't need KV cache (eg encoder-only attention)
+                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    kv_cache_spec[layer_name] = spec
 
             elif isinstance(attn_module, DeepseekV32IndexerCache):
                 # TODO: This mirrors upstream's separated KV/indexer specs for
@@ -4888,6 +4923,21 @@ class NPUModelRunner(GPUModelRunner):
                 # Remove this special case once the generic vLLM spec/backend
                 # path can describe the Ascend SFA indexer layout directly.
                 cache_sparse_li_c8 = self.ascend_config.is_sparse_li_c8_layer(layer_name)
+                # Align the indexer K-cache page size to the main MLA cache
+                # page size, mirroring how patch_mamba_config aligns the mamba
+                # page to the MLA page. The indexer head_size (index_head_dim,
+                # e.g. 128) is not integer-divisible by the MLA head_size
+                # (kv_lora_rank + qk_rope, e.g. 576) and the two specs live in
+                # separate uniform-type groups, so without this padding
+                # get_uniform_page_size asserts on the differing page sizes.
+                _hf = self.model_config.hf_text_config
+                _mla_head_size = (
+                    get_sfa_qsfa_packed_head_dim(_hf.kv_lora_rank, _hf.qk_rope_head_dim)
+                    if cache_sparse_li_c8
+                    else _hf.kv_lora_rank + _hf.qk_rope_head_dim
+                )
+                _mla_dtype = self.c8_k_cache_dtype if cache_sparse_li_c8 else self.kv_cache_dtype
+                _mla_page_size = self.block_size * _mla_head_size * get_dtype_size(_mla_dtype)
                 kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
                     block_size=self.block_size,
                     num_kv_heads=1,
@@ -4898,6 +4948,7 @@ class NPUModelRunner(GPUModelRunner):
                     scale_dtype=self.c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8,
                     cache_sparse_li_c8=cache_sparse_li_c8,
                     sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
+                    page_size_padded=_mla_page_size,
                 )
 
             elif isinstance(attn_module, MambaBase):

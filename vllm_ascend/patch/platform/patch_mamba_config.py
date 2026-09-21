@@ -92,6 +92,14 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
     attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
+    logger.info(
+        "[patch_mamba] use_mla=%s attn_num_kv_heads=%s kv_lora_rank=%s qk_rope=%s "
+        "ssm_block_page_size=%s attn_single_token_k_page_size=%s attn_block_size=%s",
+        model_config.use_mla, attn_num_kv_heads,
+        getattr(model_config.hf_text_config, 'kv_lora_rank', None),
+        getattr(model_config.hf_text_config, 'qk_rope_head_dim', None),
+        ssm_block_page_size, attn_single_token_k_page_size, attn_block_size,
+    )
     assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
         "Cannot align ssm_page_size and attn_page_size."
     )

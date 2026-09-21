@@ -31,6 +31,13 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # indexer spec.
     cache_sparse_sfa_c8: bool = False
     store_on_host: bool = False
+    # MLA on Ascend always indexes KV pages by block stride, enabling
+    # page-size padding for hybrid models (MLA + GDN/mamba).
+    indexes_kv_by_block_stride: bool = True
+    # Size of the RoPE portion of head_size; the remainder is kv_lora_rank.
+    # Ascend MLA stores K and rope in separate cache tensors, so page_size_bytes
+    # for alignment purposes uses only the K part.
+    qk_rope_head_dim: int = 0
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -88,6 +95,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             model_version=first_spec.model_version,
             cache_sparse_sfa_c8=first_spec.cache_sparse_sfa_c8,
             store_on_host=store_on_host_set.pop(),
+            qk_rope_head_dim=first_spec.qk_rope_head_dim,
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
@@ -114,10 +122,25 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
     cache_sparse_li_c8: bool = False
     cache_dtype_str: str | None = None
     sfa_dcp_replicated_indexer_size: int = 1
+    # The indexer K cache is paged and indexed by block stride (block_idx,
+    # block_off) exactly like the main MLA cache, so opt in to page-size
+    # padding.  This lets the indexer cache (head_size=index_head_dim, e.g.
+    # 128) coexist in the same UniformType group as the main MLA cache
+    # (head_size=kv_lora_rank+qk_rope, e.g. 576) even when their page sizes
+    # are not integer-divisible (e.g. 576/128=4.5), matching the MLA spec's
+    # own indexes_kv_by_block_stride=True.
+    indexes_kv_by_block_stride: bool = True
 
     @property
     def page_size_bytes(self) -> int:
-        return self.real_page_size_bytes
+        real = self.real_page_size_bytes
+        # Respect page_size_padded set by unify_kv_cache_spec_page_size so the
+        # indexer cache can be padded to the MLA cache's page size (the indexer
+        # backend indexes by block stride, see indexes_kv_by_block_stride).
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= real
+            return self.page_size_padded
+        return real
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -161,6 +184,10 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             scale_dtype=scale_dtype_set.pop(),
             cache_sparse_li_c8=cache_sparse_li_c8_set.pop(),
             sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size_set.pop(),
+            # Preserve page_size_padded set in model_runner_v1 so the merged
+            # indexer spec still reports the MLA-aligned page size to
+            # get_uniform_page_size.
+            page_size_padded=specs[0].page_size_padded,
         )
 
 
