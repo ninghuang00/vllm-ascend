@@ -4831,15 +4831,6 @@ class NPUModelRunner(GPUModelRunner):
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                 continue
-            elif self.use_compress:
-                # Skip modules that don't need KV cache (eg encoder-only attention)
-                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
-            elif isinstance(attn_module, Attention):
-                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
-                    attn_layer_names.add(layer_name)
-
             elif isinstance(attn_module, MLAAttention):
                 if self.use_sparse:
                     impl = attn_module.impl
@@ -4866,6 +4857,7 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=cache_sparse_sfa_c8,
                         store_on_host=self.sparse_kv_offload_enabled,
+                        qk_rope_head_dim=self.model_config.hf_text_config.qk_rope_head_dim,
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
@@ -4879,8 +4871,19 @@ class NPUModelRunner(GPUModelRunner):
                         head_size=head_size,
                         dtype=dtype,
                         cache_dtype_str=cache_dtype_str,
+                        qk_rope_head_dim=attn_module.qk_rope_head_dim,
                     )
                     attn_layer_names.add(layer_name)
+
+            elif isinstance(attn_module, Attention):
+                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    kv_cache_spec[layer_name] = spec
+                    attn_layer_names.add(layer_name)
+
+            elif self.use_compress:
+                # Skip modules that don't need KV cache (eg encoder-only attention)
+                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    kv_cache_spec[layer_name] = spec
 
             elif isinstance(attn_module, DeepseekV32IndexerCache):
                 # TODO: This mirrors upstream's separated KV/indexer specs for

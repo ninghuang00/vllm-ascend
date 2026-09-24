@@ -86,6 +86,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             alignment=first_spec.alignment,
             compress_ratio=first_spec.compress_ratio,
             model_version=first_spec.model_version,
+            qk_rope_head_dim=first_spec.qk_rope_head_dim,
             cache_sparse_sfa_c8=first_spec.cache_sparse_sfa_c8,
             store_on_host=store_on_host_set.pop(),
         )
