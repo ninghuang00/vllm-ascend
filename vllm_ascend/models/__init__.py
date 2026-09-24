@@ -54,3 +54,7 @@ def register_model():
     ModelRegistry.register_model(
         "Eagle3LlamaForCausalLM", "vllm_ascend.models.llama_eagle3:AscendEagle3LlamaForCausalLM"
     )
+    ModelRegistry.register_model(
+        "Qwen3_6MLAForCausalLM",
+        "vllm_ascend.models.qwen3_6_mla:Qwen3_6MLAForCausalLM",
+    )

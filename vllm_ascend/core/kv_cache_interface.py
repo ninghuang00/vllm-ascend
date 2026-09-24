@@ -93,6 +93,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             scale_dim=first_spec.scale_dim,
             scale_dtype=first_spec.scale_dtype,
             alignment=first_spec.alignment,
+            qk_rope_head_dim=first_spec.qk_rope_head_dim,
             cache_sparse_sfa_c8=first_spec.cache_sparse_sfa_c8,
             store_on_host=first_spec.store_on_host,
         )
