@@ -139,19 +139,13 @@ class Qwen3_6KVProjWithMQA(nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.nope_dim = head_dim - rope_dim  # 192
-        self.k_proj = ReplicatedLinear(
+        self.kv_proj = ReplicatedLinear(
             hidden_size,
-            num_kv_heads * head_dim,
+            num_kv_heads * head_dim * 2,  # k+v combined = 2*512 = 1024
             bias=False,
-            prefix="k_proj",
+            prefix="kv_proj",
         )
         self.k_norm = Qwen3_5RMSNorm(head_dim, eps=rms_norm_eps)
-        self.v_proj = ReplicatedLinear(
-            hidden_size,
-            num_kv_heads * head_dim,
-            bias=False,
-            prefix="v_proj",
-        )
 
         kv_input_dim = (
             num_kv_heads * rope_dim       # k_rot  = 128
@@ -163,15 +157,20 @@ class Qwen3_6KVProjWithMQA(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor]:
         bs_seq = hidden_states.shape[:-1]
 
+        # --- K+V in a single matmul ---
+        kv = self.kv_proj(hidden_states)[0]                    # [N, 1024]
+        k, v = kv.split(
+            [self.num_kv_heads * self.head_dim,
+             self.num_kv_heads * self.head_dim], dim=-1
+        )                                                       # k [N,512], v [N,512]
+
         # --- K path ---
-        k = self.k_proj(hidden_states)[0]                       # [N, 512]
         k = k.view(*bs_seq, self.num_kv_heads, self.head_dim)   # [N, 2, 256]
         k = self.k_norm(k)                                       # RMSNorm on 256
         k_rot = k[..., : self.rope_dim]                          # [N, 2, 64]
         k_pass = k[..., self.rope_dim :]                         # [N, 2, 192]
 
         # --- V path ---
-        v = self.v_proj(hidden_states)[0]                       # [N, 512]
         v = v.view(*bs_seq, self.num_kv_heads, self.head_dim)   # [N, 2, 256]
 
         # --- flatten & concat ---
@@ -427,16 +426,10 @@ class Qwen3_6MLAImplMixin:
         self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()      # (8, 192, 512)
         self.W_UK_T = maybe_trans_nz(self.W_UK_T)
 
-        # Rebuild kv_b_proj weight expanded to num_heads for prefill path.
-        kv_b_proj_expanded = torch.cat(
-            [W_UK, W_UV], dim=-1
-        )  # [512, 8, 448]
-        kv_b_proj_expanded = kv_b_proj_expanded.permute(1, 2, 0).reshape(
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            self.kv_lora_rank,
-        ).contiguous()  # [3584, 512]
-        # Replace the parameter with expanded version
-        self.kv_b_proj.weight = nn.Parameter(kv_b_proj_expanded, requires_grad=False)
+        # Keep kv_b_proj unexpanded [896, 512] for prefill path.
+        # The prefill path uses _kv_head_idx to select and expand on-the-fly,
+        # saving 4× weight memory (3584×512 → 896×512 = -2.6 MB/layer).
+        self._kv_head_idx = kv_head_idx
 
         del kv_b_proj_weight, W_UK, W_UV
         torch.npu.empty_cache()
@@ -488,7 +481,10 @@ class Qwen3_6MLAImplMixin:
         prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
         prefill_k_nope, prefill_value = (
             self.kv_b_proj(prefill_k_c_normed)[0]
-            .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            .view(-1, self.num_kv_heads_original,
+                  self.qk_nope_head_dim + self.v_head_dim)
+            [:, self._kv_head_idx:self._kv_head_idx + 1]
+            .expand(-1, self.num_heads, -1)
             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         )
         prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, -1)
@@ -690,7 +686,11 @@ class Qwen3_6MLAImplMixin:
                 kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
                     torch.bfloat16
                 )
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                -1, self.num_kv_heads_original,
+                self.qk_nope_head_dim + self.v_head_dim
+            )[:, self._kv_head_idx:self._kv_head_idx + 1].expand(
+                -1, self.num_heads, -1)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
 
@@ -1165,6 +1165,14 @@ class Qwen3_6MLAModel(Qwen3_5Model):
                 ".self_attn.v_proj.": ".self_attn.kv_a_proj_with_mqa.v_proj.",
                 ".self_attn.kv_a_proj.": ".self_attn.kv_a_proj_with_mqa.kv_a_proj.",
                 ".self_attn.q_norm.": ".self_attn.q_proj.q_norm.",
+            }
+        )
+        | WeightsMapper(
+            orig_to_new_stacked={
+                ".kv_a_proj_with_mqa.k_proj": (
+                    ".kv_a_proj_with_mqa.kv_proj", 0),
+                ".kv_a_proj_with_mqa.v_proj": (
+                    ".kv_a_proj_with_mqa.kv_proj", 1),
             }
         )
     )
