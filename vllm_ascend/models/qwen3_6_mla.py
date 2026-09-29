@@ -1167,14 +1167,6 @@ class Qwen3_6MLAModel(Qwen3_5Model):
                 ".self_attn.q_norm.": ".self_attn.q_proj.q_norm.",
             }
         )
-        | WeightsMapper(
-            orig_to_new_stacked={
-                ".kv_a_proj_with_mqa.k_proj": (
-                    ".kv_a_proj_with_mqa.kv_proj", 0),
-                ".kv_a_proj_with_mqa.v_proj": (
-                    ".kv_a_proj_with_mqa.kv_proj", 1),
-            }
-        )
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1244,7 +1236,47 @@ class Qwen3_6MLAModel(Qwen3_5Model):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(self._merge_kv_proj_shards(weights))
+
+    @staticmethod
+    def _merge_kv_proj_shards(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Merge separate k_proj/v_proj shards into the fused kv_proj weight.
+
+        The merged ``kv_proj`` is a ReplicatedLinear whose weight_loader only
+        accepts full-size tensors, and the WeightsMapper ``orig_to_new_stacked``
+        shard mechanism only works for modules with a custom ``load_weights``
+        (e.g. MergedColumnParallelLinear). So we pair up the shards here and
+        concatenate along dim 0 to match ``kv.split([k_size, v_size])`` in
+        ``Qwen3_6KVProjWithMQA.forward``.
+        """
+        KV_SUFFIXES = (
+            (".kv_a_proj_with_mqa.k_proj.weight", ".kv_a_proj_with_mqa.kv_proj.weight", 0),
+            (".kv_a_proj_with_mqa.v_proj.weight", ".kv_a_proj_with_mqa.kv_proj.weight", 1),
+        )
+        pending: dict[str, dict[int, torch.Tensor]] = {}
+        for name, data in weights:
+            handled = False
+            for shard_suffix, fused_suffix, idx in KV_SUFFIXES:
+                if name.endswith(shard_suffix):
+                    base = name[: -len(shard_suffix)]
+                    parts = pending.setdefault(base, {})
+                    parts[idx] = data
+                    if len(parts) == 2:
+                        yield f"{base}{fused_suffix}", torch.cat(
+                            [parts[0], parts[1]], dim=0
+                        )
+                        del pending[base]
+                    handled = True
+                    break
+            if not handled:
+                yield name, data
+        # Defensive: flush any unpaired leftovers under their original names.
+        for base, parts in pending.items():
+            for idx, data in parts.items():
+                shard_suffix = KV_SUFFIXES[idx][0]
+                yield f"{base}{shard_suffix}", data
 
 
 # ════════════════════════════════════════════════════════════════════
