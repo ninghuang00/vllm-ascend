@@ -244,14 +244,24 @@ class Qwen3_6QProj(nn.Module):
             query.reshape(-1, local_heads * self.qk_head_dim),
         )
 
-    def get_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return the gate tensor [N, local_heads * head_dim]."""
+    def forward_qg(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single qg_proj call returning both normed query and gate.
+
+        Replaces the separate ``forward()`` + ``get_gate()`` calls that each
+        invoke ``qg_proj`` independently, halving the Q-side matmul count.
+        """
         q_and_gate = self.qg_proj(hidden_states)[0]
         block = self._qk_head_dim + self._head_dim  # 512
         local_heads = q_and_gate.shape[-1] // block
         qg = q_and_gate.view(-1, local_heads, block)
-        gate = qg[..., self._qk_head_dim:]  # [tokens, heads, head_dim]
-        return gate.reshape(-1, local_heads * self._head_dim)
+        query = qg[..., : self._qk_head_dim]  # [tokens, heads, qk_head_dim]
+        gate = qg[..., self._qk_head_dim:]    # [tokens, heads, head_dim]
+        query = query.view(-1, local_heads, self.head_dim)
+        query = self.q_norm(query)
+        return (
+            query.reshape(-1, local_heads * self.qk_head_dim),
+            gate.reshape(-1, local_heads * self._head_dim),
+        )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -442,7 +452,12 @@ class Qwen3_6MLAImplMixin:
         return self._apply_rope_neox(x, cos, sin).view(B, N, D)
 
     def _q_proj_and_k_up_proj(self, x):
-        q = self.q_proj(x)[0].view(-1, self.num_heads, self.qk_head_dim)
+        # When _precomputed_q is set (by forward()), x is already the normed
+        # query [N, heads*qk_head_dim] — skip the redundant qg_proj call.
+        if getattr(self, "_precomputed_q", None) is not None:
+            q = x.view(-1, self.num_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(x)[0].view(-1, self.num_heads, self.qk_head_dim)
         # Qwen3 layout: q[:qk_rope_head_dim] = rope, q[qk_rope_head_dim:] = nope
         q_pe = q[..., : self.qk_rope_head_dim]
         q_nope = q[..., self.qk_rope_head_dim :]
@@ -459,7 +474,10 @@ class Qwen3_6MLAImplMixin:
         num_actual_tokens = attn_metadata.num_actual_tokens
         prefill_kv_no_split = kv_no_split[num_decode_tokens:num_actual_tokens]
         prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
-        prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+        if getattr(self, "_precomputed_q", None) is not None:
+            prefill_q = prefill_q_c.view(-1, self.num_heads, self.qk_head_dim)
+        else:
+            prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
         # Qwen3 layout: rope first, nope second
         prefill_q_pe = prefill_q[..., : self.qk_rope_head_dim]
         prefill_q_nope = prefill_q[..., self.qk_rope_head_dim :]
@@ -477,6 +495,36 @@ class Qwen3_6MLAImplMixin:
         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
 
         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
+
+    def _mla_preprocess(self, layer_name, hidden_states, kv_cache,
+                        attn_metadata, need_gather_q_kv):
+        """Override to use pre-computed query from forward(), avoiding
+        redundant qg_proj calls inside _q_proj_and_k_up_proj and
+        mla_preprocess_prefill."""
+        has_decode = attn_metadata.num_decodes > 0
+        has_prefill = attn_metadata.num_prefills > 0
+
+        kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]
+        kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            kv_no_split.contiguous(), need_gather_q_kv)
+
+        q_c = self._precomputed_q
+
+        decode_preprocess_res = None
+        prefill_preprocess_res = None
+        if has_prefill:
+            from vllm_ascend.attention.mla_v1 import (
+                wait_for_kv_layer_from_connector)
+            wait_for_kv_layer_from_connector(layer_name)
+        if has_decode:
+            decode_preprocess_res = self.mla_preprocess_decode(
+                q_c, kv_no_split, kv_cache, attn_metadata)
+        if has_prefill:
+            prefill_preprocess_res = self.mla_preprocess_prefill(
+                q_c, kv_no_split, kv_cache, attn_metadata)
+        from vllm_ascend.attention.mla_v1 import notify_kv_cache_written
+        notify_kv_cache_written(layer_name)
+        return decode_preprocess_res, prefill_preprocess_res
 
     # ── prefill attention (force concatenated q/k) ────────────────────
     def _forward_prefill(
@@ -699,16 +747,18 @@ class Qwen3_6MLAImplMixin:
             device=hidden_states.device,
         )
 
-        # ── Compute gate ──
+        # ── Compute query and gate in a single qg_proj call ──
         hs_gathered = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             hidden_states.contiguous(), need_gather_q_kv
         )
-        gate = self.q_proj.get_gate(hs_gathered[:num_actual_tokens])
+        query, gate = self.q_proj.forward_qg(hs_gathered[:num_actual_tokens])
+        self._precomputed_q = query
 
-        # ── MLA Preprocess ──
+        # ── MLA Preprocess (uses _precomputed_q, no redundant qg_proj) ──
         decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
             layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
         )
+        self._precomputed_q = None
 
         if decode_preprocess_res is not None:
             output_decode = self._forward_decode(
