@@ -640,7 +640,9 @@ class Qwen3_6MLAImplMixin:
         if cached is not None:
             return cached
 
-        lens = chunked_context.chunk_seq_lens.to(device=device, dtype=torch.int64)
+        # Build on CPU (chunk_seq_lens is a host tensor; repeat_interleave
+        # is slow on device), then transfer once.
+        lens = chunked_context.chunk_seq_lens.to(dtype=torch.int64)
         ctx = lens.sum(dim=0)                                # [N]
         dst_cu = torch.cumsum(ctx, 0) - ctx                  # [N]
         col_prefix = lens.cumsum(dim=0) - lens               # [iters, N]
@@ -654,12 +656,23 @@ class Qwen3_6MLAImplMixin:
             return result
 
         seg_end = torch.cumsum(l, 0)
-        within = torch.arange(total, device=device) - torch.repeat_interleave(
-            seg_end - l, l)
+        within = torch.arange(total) - torch.repeat_interleave(seg_end - l, l)
         dst_index = torch.repeat_interleave(dst_off, l) + within
-        result = (dst_index, ctx)
+        result = (dst_index.to(device), ctx.to(device))
         chunked_context._merge_dst = result
         return result
+
+    def _v_up_proj(self, x):
+        """Override the base V-side absorption.
+
+        The base uses npu_transpose_batchmatmul(perm_y=(1,0,2)) to emit
+        (B, H, V) directly, but that op's host dispatch is ~3x slower than a
+        plain bmm (51us vs 18us per launch, measured on 910B3). Return the
+        head-major (H, B, V) result instead; forward() absorbs the transpose
+        into the strided copy that writes o_proj_input anyway.
+        """
+        x = x.view(self.num_heads, -1, self.kv_lora_rank)   # (H, B, L)
+        return torch.bmm(x, self.W_UV)                       # (H, B, V)
 
     def _gather_context_kv(self, kv_c_and_k_pe_cache, attn_metadata):
         """Load the historical-context K/V from the paged cache, up-project
@@ -763,33 +776,40 @@ class Qwen3_6MLAImplMixin:
         """
         cached = getattr(chunked_context, "_merge_ctx_cur", None)
         if cached is None:
-            device = ctx_key.device
             # actual_seq_lengths_q is CUMULATIVE (FIA convention); convert to
-            # per-sequence lengths first.
-            cu_q = torch.tensor(
-                q_lens_list, dtype=torch.int64, device=device)
+            # per-sequence lengths first. Build all index tensors on CPU:
+            # chunk_seq_lens is a host (pin-memory) tensor and
+            # torch.repeat_interleave is prohibitively slow on device
+            # (~2.3 ms per call, 4 calls per step). Transfer once at the end.
+            cu_q = torch.tensor(q_lens_list, dtype=torch.int64)
             q_lens = torch.diff(
-                cu_q, prepend=torch.zeros(1, dtype=torch.int64, device=device))
+                cu_q, prepend=torch.zeros(1, dtype=torch.int64))
             ctx_lens = chunked_context.chunk_seq_lens.to(
-                device=device, dtype=torch.int64).sum(dim=0)      # [N]
+                dtype=torch.int64).sum(dim=0)                 # [N]
             kv_lens = ctx_lens + q_lens
-            dst_cu = torch.cumsum(kv_lens, 0) - kv_lens           # [N]
+            dst_cu = torch.cumsum(kv_lens, 0) - kv_lens       # [N]
             sum_ctx = int(ctx_lens.sum())
             sum_q = int(q_lens.sum())
             total = sum_ctx + sum_q
 
             cu_ctx = torch.cumsum(ctx_lens, 0) - ctx_lens
-            within_c = torch.arange(sum_ctx, device=device) - torch.repeat_interleave(
+            within_c = torch.arange(sum_ctx) - torch.repeat_interleave(
                 cu_ctx, ctx_lens)
             ctx_dst = torch.repeat_interleave(dst_cu, ctx_lens) + within_c
 
-            within_q = torch.arange(sum_q, device=device) - torch.repeat_interleave(
+            within_q = torch.arange(sum_q) - torch.repeat_interleave(
                 cu_q - q_lens, q_lens)
             cur_dst = torch.repeat_interleave(dst_cu + ctx_lens, q_lens) + within_q
 
             # FIA expects CUMULATIVE actual_seq_lengths_kv.
             kv_lens_cum = torch.cumsum(kv_lens, 0).tolist()
-            cached = (ctx_dst, cur_dst, kv_lens_cum, total)
+            device = ctx_key.device
+            cached = (
+                ctx_dst.to(device),
+                cur_dst.to(device),
+                kv_lens_cum,
+                total,
+            )
             chunked_context._merge_ctx_cur = cached
         ctx_dst, cur_dst, kv_lens_list, total = cached
 
@@ -862,7 +882,13 @@ class Qwen3_6MLAImplMixin:
                 attn_metadata,
                 getattr(decode_preprocess_res, "dequant_scale_q_nope", None),
             )
-            o_proj_input[:num_decode_tokens] = output_decode
+            # _v_up_proj override returns head-major (H, B, V); absorb the
+            # (H,B,V)->(B,H,V) transpose into this strided copy instead of
+            # paying for it inside the matmul op (npu_transpose_batchmatmul
+            # dispatches ~3x slower on host than plain bmm).
+            o_proj_input[:num_decode_tokens].view(
+                num_decode_tokens, self.num_heads, self.v_head_dim
+            ).copy_(output_decode.permute(1, 0, 2))
 
         if prefill_preprocess_res is not None:
             output_prefill = self._forward_prefill(
