@@ -523,6 +523,16 @@ class Qwen3_6MLAImplMixin:
         return decode_preprocess_res, prefill_preprocess_res
 
     # ── prefill attention (force concatenated q/k) ────────────────────
+    # Single causal FIA covering [context; current-chunk] K/V per sequence:
+    # the context K/V (paged cache -> kv_b_proj up-projection) is interleaved
+    # with the current chunk's K/V into a per-sequence contiguous buffer, and
+    # one sparse_mode=3 call with actual_seq_lengths_kv = ctx+q computes the
+    # full chunked-prefill attention. This replaces the previous scheme of a
+    # current-chunk-only FIA plus a separate context FIA plus an LSE merge
+    # (npu_attention_update), removing one FIA call and the merge per layer
+    # per prefill step. The causal convention (query i attends kv positions
+    # <= kv_len - q_len + i) is the same proven pattern the standard
+    # (non-MLA) prefill path uses for chunked prefill.
     def _forward_prefill(
         self,
         q_nope: torch.Tensor,
@@ -539,7 +549,6 @@ class Qwen3_6MLAImplMixin:
         prefill_meta = attn_metadata.prefill
 
         actual_seq_lengths_q = prefill_meta.actual_seq_lengths_q
-        actual_seq_lengths_kv = actual_seq_lengths_q.copy()
 
         original_dtype = q_nope.dtype
         need_dtype_convert = original_dtype != torch.bfloat16
@@ -550,20 +559,17 @@ class Qwen3_6MLAImplMixin:
             k_pe = k_pe.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
 
-        attn_output = torch.empty(
-            num_tokens, self.num_heads, self.v_head_dim,
-            dtype=q_nope.dtype, device=q_nope.device,
-        )
-        attn_lse = torch.empty(
-            self.num_heads, num_tokens, dtype=torch.float32, device=q_nope.device,
-        )
+        record_attention_compute_start()
+
+        # Always concatenate q_pe+q_nope and k_pe+k_nope (RoPE first, matching
+        # original Qwen3.6 model: [rot(64), nope(192)] = 256 >= v_head_dim(256))
+        query = torch.cat((q_pe, q_nope), dim=-1)
+        cur_key = torch.cat((k_pe, k_nope), dim=-1)
 
         common_kwargs = {
             "num_heads": self.num_heads,
             "num_key_value_heads": self.num_heads,
             "input_layout": "TND",
-            "atten_mask": prefill_meta.attn_mask,
-            "sparse_mode": 3,
             "scale": self.scale,
             "antiquant_mode": 0,
             "antiquant_scale": None,
@@ -571,23 +577,38 @@ class Qwen3_6MLAImplMixin:
             "block_size": 0,
             "softmax_lse_flag": True,
             "actual_seq_lengths": actual_seq_lengths_q,
-            "actual_seq_lengths_kv": actual_seq_lengths_kv,
         }
-        record_attention_compute_start()
 
-        # Always concatenate q_pe+q_nope and k_pe+k_nope (RoPE first, matching
-        # original Qwen3.6 model: [rot(64), nope(192)] = 256 >= v_head_dim(256))
-        query = torch.cat((q_pe, q_nope), dim=-1)
-        key = torch.cat((k_pe, k_nope), dim=-1)
+        cc = prefill_meta.chunked_context
+        ctx_key = None
+        if cc is not None and len(cc.seq_tot) > 0:
+            ctx_key, ctx_val, _ = self._gather_context_kv(
+                kv_c_and_k_pe_cache, attn_metadata)
 
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
-            query, key.contiguous(), value.contiguous(), **common_kwargs
-        )
-
-        attn_output, attn_lse = self._compute_prefill_context(
-            q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim,
-            attn_metadata, attn_output, attn_lse,
-        )
+        if ctx_key is not None:
+            merged_key, merged_val, merged_kv_lens = self._merge_context_current(
+                cc, ctx_key, ctx_val, cur_key, value.contiguous(),
+                actual_seq_lengths_q)
+            # sparse_mode=3 + the 2048x2048 split-fuse causal mask gives the
+            # right-aligned chunked-prefill causal pattern (query i attends
+            # kv[0 : kv_len - q_len + i + 1]); verified the kernel applies
+            # this template mask regardless of sequence length.
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query, merged_key, merged_val,
+                atten_mask=prefill_meta.attn_mask,
+                sparse_mode=3,
+                actual_seq_lengths_kv=merged_kv_lens,
+                **common_kwargs,
+            )
+        else:
+            # No context: plain causal self-attention over the current chunk.
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query, cur_key.contiguous(), value.contiguous(),
+                atten_mask=prefill_meta.attn_mask,
+                sparse_mode=3,
+                actual_seq_lengths_kv=actual_seq_lengths_q.copy(),
+                **common_kwargs,
+            )
 
         attn_output = attn_output.reshape(
             [num_tokens, self.num_heads * self.v_head_dim],
@@ -598,121 +619,192 @@ class Qwen3_6MLAImplMixin:
 
         return attn_output
 
-    # ── chunked prefill context (override) ───────────────────────────
-    # The base class _compute_prefill_context uses separate query_rope /
-    # key_rope when head_padding == 0, leaving query = q_nope (192) which
-    # violates the FIA constraint (query head_dim >= value head_dim 256).
-    # Override to always concatenate q_pe + q_nope = 256, matching the fix
-    # already applied in _forward_prefill above.
-    def _compute_prefill_context(
-        self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        kv_c_and_k_pe_cache: tuple[torch.Tensor],
-        rope_dim: int,
-        attn_metadata,
-        prefix_output: torch.Tensor,
-        prefix_lse: torch.Tensor,
-    ):
+    @staticmethod
+    def _merged_context_dst_index(chunked_context, device):
+        """Build (and cache on the metadata) the destination index that
+        scatters the per-chunk context layout into a per-sequence
+        contiguous layout.
+
+        Source layout: chunk i holds sequence j at chunk-local offsets
+        [cu[i, j], cu[i, j+1]). Target layout: all chunks of sequence j are
+        contiguous. The index only depends on the metadata, so it is cached
+        on the ChunkedContextMetadata instance and shared by all attention
+        layers in the same step.
+
+        Returns (dst_index, ctx_lens) where dst_index[t] is the destination
+        of source token t when chunks are enumerated in (chunk, seq) order,
+        and ctx_lens[j] is the total context length of sequence j (device
+        tensor). Returns (None, None) when the context is empty.
+        """
+        cached = getattr(chunked_context, "_merge_dst", None)
+        if cached is not None:
+            return cached
+
+        lens = chunked_context.chunk_seq_lens.to(device=device, dtype=torch.int64)
+        ctx = lens.sum(dim=0)                                # [N]
+        dst_cu = torch.cumsum(ctx, 0) - ctx                  # [N]
+        col_prefix = lens.cumsum(dim=0) - lens               # [iters, N]
+
+        l = lens.flatten()                                   # [iters*N]
+        dst_off = (dst_cu.unsqueeze(0) + col_prefix).flatten()
+        total = int(l.sum())
+        if total == 0:
+            result = (None, None)
+            chunked_context._merge_dst = result
+            return result
+
+        seg_end = torch.cumsum(l, 0)
+        within = torch.arange(total, device=device) - torch.repeat_interleave(
+            seg_end - l, l)
+        dst_index = torch.repeat_interleave(dst_off, l) + within
+        result = (dst_index, ctx)
+        chunked_context._merge_dst = result
+        return result
+
+    def _gather_context_kv(self, kv_c_and_k_pe_cache, attn_metadata):
+        """Load the historical-context K/V from the paged cache, up-project
+        via kv_b_proj, and return (key, value, ctx_lens) in a per-sequence
+        contiguous TND layout. key/value are [sum_ctx, H, 256]. Returns
+        (None, None, None) when the context is empty.
+        """
         from vllm_ascend.device.device_op import DeviceOperator
 
-        assert len(kv_c_and_k_pe_cache) > 1
         prefill_metadata = attn_metadata.prefill
-        if prefill_metadata is None or prefill_metadata.chunked_context is None:
-            return prefix_output, prefix_lse
+        cc = prefill_metadata.chunked_context
+        iters = len(cc.seq_tot)
+        if iters == 0:
+            return None, None, None
 
-        iters = len(prefill_metadata.chunked_context.seq_tot)
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
-        latent_kv_dim = kv_c_and_k_pe_cache[0].size(-1)
+        latent_kv_dim = cache_kv_c.size(-1)
+        rope_dim = self.qk_rope_head_dim
 
-        actual_seq_lengths_q = prefill_metadata.actual_seq_lengths_q
-
-        if iters == 0:
-            return prefix_output, prefix_lse
-
-        num_tokens = q_nope.size(0)
-        D = self.v_head_dim
-        H = self.num_heads
-
-        if prefix_lse.dim() == 2:
-            prefix_lse = prefix_lse.transpose(0, 1).unsqueeze(-1)
-        prefix_output = prefix_output.to(torch.float32)
-        prefix_lse = prefix_lse.to(torch.float32)
-        out_list = [prefix_output.reshape(num_tokens * H, D)]
-        lse_list = [prefix_lse.reshape(num_tokens * H)]
-
-        # Force concatenated query (q_pe + q_nope = 256 >= v_head_dim 256)
-        query = torch.cat((q_pe, q_nope), dim=-1)
-
-        common_kwargs = {
-            "num_heads": self.num_heads,
-            "num_key_value_heads": self.num_heads,
-            "input_layout": "TND",
-            "atten_mask": None,
-            "sparse_mode": 0,
-            "scale": self.scale,
-            "antiquant_mode": 0,
-            "antiquant_scale": None,
-            "softmax_lse_flag": True,
-            "actual_seq_lengths": actual_seq_lengths_q,
-        }
-
+        keys, vals = [], []
         for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
+            toks = cc.seq_tot[i]
             context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
-            kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device)
-            k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_pe.dtype, device=q_pe.device)
+            kv_c_normed = torch.empty(
+                toks, num_heads, latent_kv_dim,
+                dtype=cache_kv_c.dtype, device=cache_kv_c.device)
+            k_pe = torch.empty(
+                toks, num_heads, rope_dim,
+                dtype=cache_k_pe.dtype, device=cache_k_pe.device)
 
             DeviceOperator.kv_cache_load(
                 cache_kv_c,
                 cache_k_pe,
                 prefill_metadata.block_table,
                 context_seq_len_npu,
-                prefill_metadata.chunked_context.starts[i],
+                cc.starts[i],
                 key=kv_c_normed,
                 value=k_pe,
             )
             kv_c_normed, k_pe = self._reorg_kvcache(
-                kv_c_normed,
-                k_pe,
-                chunked_context=prefill_metadata.chunked_context,
-                chunk_idx=i,
-                toks=toks,
+                kv_c_normed, k_pe,
+                chunked_context=cc, chunk_idx=i, toks=toks,
             )
             kv_c_normed = kv_c_normed.squeeze()
             if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
-                kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
-                    torch.bfloat16
-                )
+                kv_c_normed = torch.mul(
+                    kv_c_normed.to(self.fak_descale_float.dtype),
+                    self.fak_descale_float).to(torch.bfloat16)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_kv_heads_original,
                 self.qk_nope_head_dim + self.v_head_dim
             )[:, self._kv_head_idx:self._kv_head_idx + 1].expand(
                 -1, self.num_heads, -1)
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k_nope, v = kv_nope.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+            keys.append(torch.cat((k_pe, k_nope), dim=-1))
+            vals.append(v.contiguous())
 
-            actual_seq_lengths_kv = prefill_metadata.chunked_context.chunk_actual_seq_lengths_kv_list[i]
-            common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
+        if iters == 1:
+            return keys[0], vals[0], None
 
-            # Force concatenated key (k_pe + k_nope = 256 >= v_head_dim 256)
-            key = torch.cat((k_pe, k_nope), dim=-1)
+        # Multi-chunk: scatter chunks into the per-sequence contiguous layout.
+        dst, _ = self._merged_context_dst_index(cc, keys[0].device)
+        if dst is None:
+            return None, None, None
+        total = dst.shape[0]
+        key = torch.empty(
+            total, self.num_heads, self.qk_head_dim,
+            dtype=keys[0].dtype, device=keys[0].device)
+        val = torch.empty(
+            total, self.num_heads, self.v_head_dim,
+            dtype=keys[0].dtype, device=keys[0].device)
+        off = 0
+        for i in range(iters):
+            n = cc.seq_tot[i]
+            if n:
+                idx = dst[off:off + n]
+                key[idx] = keys[i]
+                val[idx] = vals[i]
+            off += n
+        return key, val, None
 
-            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
-                query, key.contiguous(), v.contiguous(), **common_kwargs
-            )
+    def _merge_context_current(
+        self,
+        chunked_context,
+        ctx_key: torch.Tensor,
+        ctx_val: torch.Tensor,
+        cur_key: torch.Tensor,
+        cur_val: torch.Tensor,
+        q_lens_list: list[int],
+    ):
+        """Interleave the per-sequence-contiguous context K/V with the
+        current-chunk K/V into merged buffers laid out as [ctx_j; cur_j]
+        per sequence, so a single causal (sparse_mode=3) FIA call with
+        actual_seq_lengths_kv = ctx+q covers the full chunked-prefill
+        attention. Index tensors are cached on the metadata and shared by
+        all attention layers in the same step.
+        """
+        cached = getattr(chunked_context, "_merge_ctx_cur", None)
+        if cached is None:
+            device = ctx_key.device
+            # actual_seq_lengths_q is CUMULATIVE (FIA convention); convert to
+            # per-sequence lengths first.
+            cu_q = torch.tensor(
+                q_lens_list, dtype=torch.int64, device=device)
+            q_lens = torch.diff(
+                cu_q, prepend=torch.zeros(1, dtype=torch.int64, device=device))
+            ctx_lens = chunked_context.chunk_seq_lens.to(
+                device=device, dtype=torch.int64).sum(dim=0)      # [N]
+            kv_lens = ctx_lens + q_lens
+            dst_cu = torch.cumsum(kv_lens, 0) - kv_lens           # [N]
+            sum_ctx = int(ctx_lens.sum())
+            sum_q = int(q_lens.sum())
+            total = sum_ctx + sum_q
 
-            if chunk_lse.dim() == 2:
-                chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
-            chunk_out = chunk_out.to(torch.float32)
-            chunk_lse = chunk_lse.to(torch.float32)
-            out_list.append(chunk_out.reshape(num_tokens * H, D))
-            lse_list.append(chunk_lse.reshape(num_tokens * H))
+            cu_ctx = torch.cumsum(ctx_lens, 0) - ctx_lens
+            within_c = torch.arange(sum_ctx, device=device) - torch.repeat_interleave(
+                cu_ctx, ctx_lens)
+            ctx_dst = torch.repeat_interleave(dst_cu, ctx_lens) + within_c
 
-        output_final, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
-        return output_final.view(num_tokens, H, D), None
+            within_q = torch.arange(sum_q, device=device) - torch.repeat_interleave(
+                cu_q - q_lens, q_lens)
+            cur_dst = torch.repeat_interleave(dst_cu + ctx_lens, q_lens) + within_q
+
+            # FIA expects CUMULATIVE actual_seq_lengths_kv.
+            kv_lens_cum = torch.cumsum(kv_lens, 0).tolist()
+            cached = (ctx_dst, cur_dst, kv_lens_cum, total)
+            chunked_context._merge_ctx_cur = cached
+        ctx_dst, cur_dst, kv_lens_list, total = cached
+
+        H = self.num_heads
+        merged_key = torch.empty(
+            total, H, self.qk_head_dim,
+            dtype=ctx_key.dtype, device=ctx_key.device)
+        merged_val = torch.empty(
+            total, H, self.v_head_dim,
+            dtype=ctx_key.dtype, device=ctx_key.device)
+        merged_key[ctx_dst] = ctx_key
+        merged_val[ctx_dst] = ctx_val
+        merged_key[cur_dst] = cur_key
+        merged_val[cur_dst] = cur_val
+        return merged_key, merged_val, kv_lens_list
 
     # ── forward with gate ─────────────────────────────────────────────
     def forward(
