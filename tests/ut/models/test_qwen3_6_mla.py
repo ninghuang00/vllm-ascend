@@ -20,7 +20,12 @@ from torch import nn
 from vllm.config import set_current_vllm_config
 
 import vllm_ascend.models.qwen3_6_mla as qwen3_6_mla
-from vllm_ascend.models.qwen3_6_mla import Qwen3_6MLAImplMixin, Qwen3_6QProj
+from vllm_ascend.models.qwen3_6_mla import (
+    Qwen3_6KVProjWithMQA,
+    Qwen3_6MLAImplMixin,
+    Qwen3_6QProj,
+)
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 
 @pytest.fixture(autouse=True)
@@ -32,11 +37,12 @@ def default_vllm_config():
 
 
 class _StubParallelLinear(nn.Module):
-    """Minimal ColumnParallelLinear stand-in with a deterministic weight."""
+    """Minimal ColumnParallelLinear/ReplicatedLinear stand-in with a weight."""
 
     def __init__(self, in_features: int, out_features: int, **kwargs):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.05)
+        self.quant_method = UnquantizedLinearMethod()
 
     def forward(self, x: torch.Tensor):
         return torch.nn.functional.linear(x, self.weight), None
@@ -103,6 +109,67 @@ def _make_bare_impl(num_heads: int = 2, qk_head_dim: int = 8, rope_dim: int = 4,
     return impl
 
 
+def test_apply_rope_neox_cpu_fallback_matches_reference():
+    impl = _make_bare_impl(rope_dim=4)
+    torch.manual_seed(1)
+    for x_shape in [(7, 2, 4), (7, 2, 1, 4)]:
+        x = torch.randn(*x_shape)
+        cos = torch.randn(7, 1, 1, 4)
+        sin = torch.randn(7, 1, 1, 4)
+
+        out = impl._apply_rope_neox(x, cos, sin)
+
+        x4 = x if x.dim() == 4 else x.unsqueeze(2)
+        x1 = x4[..., :2]
+        x2 = x4[..., 2:]
+        ref = x4 * cos + torch.cat((-x2, x1), dim=-1) * sin
+        ref = ref.squeeze(2) if x.dim() == 3 else ref
+
+        assert out.shape == x.shape
+        assert torch.equal(out, ref)
+
+
+@pytest.fixture
+def stub_replicated_linear(monkeypatch):
+    monkeypatch.setattr(qwen3_6_mla, "ReplicatedLinear", _StubParallelLinear)
+
+
+def _make_kv_proj():
+    return Qwen3_6KVProjWithMQA(
+        hidden_size=16,
+        num_kv_heads=2,
+        head_dim=8,
+        rope_dim=2,
+        kv_lora_rank=12,
+        rms_norm_eps=1e-6,
+    )
+
+
+def test_kv_proj_merged_gemm_matches_separate(stub_replicated_linear):
+    torch.manual_seed(2)
+    module = _make_kv_proj()
+    hidden = torch.randn(9, 16)
+
+    out_separate = module(hidden)[0]
+    assert module._merged_kv_weight is None
+
+    module.merge_kv_weights()
+    assert module._merged_kv_weight is not None
+    out_merged = module(hidden)[0]
+
+    assert out_merged.shape == (9, 14)
+    assert torch.equal(out_merged, out_separate)
+
+
+def test_merge_kv_weights_skips_quantized(stub_replicated_linear):
+    module = _make_kv_proj()
+    module.k_proj.quant_method = object()  # not UnquantizedLinearMethod
+
+    module.merge_kv_weights()
+
+    assert module._merged_kv_weight is None
+
+
 def test_q_proj_and_k_up_proj_uses_stashed_decode_range():
     impl = _make_bare_impl()
     num_decode, num_actual = 3, 7
@@ -114,10 +181,11 @@ def test_q_proj_and_k_up_proj_uses_stashed_decode_range():
 
     q = q_flat[:num_decode].view(-1, impl.num_heads, impl.qk_head_dim)
     q_pe_ref = q[..., : impl.qk_rope_head_dim]
-    q_nope_ref = q[..., impl.qk_rope_head_dim :].transpose(0, 1)
-    ql_nope_ref = torch.bmm(q_nope_ref, impl.W_UK_T).transpose(0, 1)
+    q_nope_ref = q[..., impl.qk_rope_head_dim :]
+    # Reference: broadcast (B, N, 1, P) x (N, P, L) -> (B, N, 1, L)
+    ql_nope_ref = torch.matmul(q_nope_ref.unsqueeze(2), impl.W_UK_T)
 
-    assert ql_nope.shape == (num_decode, impl.num_heads, impl.kv_lora_rank)
+    assert ql_nope.shape == (num_decode, impl.num_heads, 1, impl.kv_lora_rank)
     assert torch.equal(ql_nope, ql_nope_ref)
     assert torch.equal(q_pe, q_pe_ref)
 
@@ -131,7 +199,7 @@ def test_q_proj_and_k_up_proj_falls_back_without_stash():
     ql_nope, q_pe = impl._q_proj_and_k_up_proj(x)
 
     impl.q_proj.assert_called_once_with(x)
-    assert ql_nope.shape == (4, impl.num_heads, impl.kv_lora_rank)
+    assert ql_nope.shape == (4, impl.num_heads, 1, impl.kv_lora_rank)
 
 
 def test_mla_preprocess_prefill_uses_stashed_prefill_range():

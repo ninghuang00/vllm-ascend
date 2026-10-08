@@ -100,6 +100,13 @@ if TYPE_CHECKING:
 # q_lora_rank       = None (no Q low-rank)
 # num_heads         = 16,  num_kv_heads = 2
 
+# torch_npu.npu_rotary_mul constraints (see the operator doc): only used when
+# the call shape is supported, otherwise _apply_rope_neox falls back to the
+# plain PyTorch chain.
+_NPU_ROTARY_MUL_MAX_HEAD_DIM = 896
+_NPU_ROTARY_MUL_MAX_BATCH_OR_HEADS = 1000
+_HAS_NPU_ROTARY_MUL = hasattr(torch_npu, "npu_rotary_mul")
+
 
 # ════════════════════════════════════════════════════════════════════
 #  1.  Custom modules
@@ -160,19 +167,47 @@ class Qwen3_6KVProjWithMQA(nn.Module):
         )                                   # total  = 1024
         self.kv_a_proj = nn.Linear(kv_input_dim, kv_lora_rank + rope_dim, bias=False)
 
+        # Row-concatenated [k_proj; v_proj] weight for the single fused GEMM
+        # (set by merge_kv_weights after loading; None keeps the two-GEMM path).
+        self._merged_kv_weight: torch.Tensor | None = None
+
+    def merge_kv_weights(self) -> None:
+        """Fuse ``k_proj`` / ``v_proj`` into one GEMM weight ``[k | v]``.
+
+        Both projections consume the same input, so a single
+        ``[hidden, 2 * num_kv_heads * head_dim]`` GEMM replaces two
+        ``[hidden, num_kv_heads * head_dim]`` GEMMs. Only done for
+        unquantized weights; quantized linears keep separate calls.
+        """
+        if not (
+            isinstance(self.k_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.v_proj.quant_method, UnquantizedLinearMethod)
+        ):
+            return
+        self._merged_kv_weight = torch.cat(
+            [self.k_proj.weight, self.v_proj.weight], dim=0
+        ).contiguous()
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor]:
         bs_seq = hidden_states.shape[:-1]
 
-        # --- K path ---
-        k = self.k_proj(hidden_states)[0]                       # [N, 512]
-        k = k.view(*bs_seq, self.num_kv_heads, self.head_dim)   # [N, 2, 256]
+        # --- K/V projection (single fused GEMM when available) ---
+        if self._merged_kv_weight is not None:
+            # [N, 2 * num_kv_heads * head_dim] laid out as [k(512) | v(512)]
+            kv = torch.nn.functional.linear(hidden_states, self._merged_kv_weight)
+            kv = kv.view(*bs_seq, 2 * self.num_kv_heads, self.head_dim)
+            k = kv[..., : self.num_kv_heads, :]
+            v = kv[..., self.num_kv_heads :, :]
+        else:
+            k = self.k_proj(hidden_states)[0]                   # [N, 512]
+            v = self.v_proj(hidden_states)[0]                   # [N, 512]
+            k = k.view(*bs_seq, self.num_kv_heads, self.head_dim)
+            v = v.view(*bs_seq, self.num_kv_heads, self.head_dim)
+
+        # --- K norm + rot/pass split ---
         k = self.k_norm(k)                                       # RMSNorm on 256
         k_rot = k[..., : self.rope_dim]                          # [N, 2, 64]
         k_pass = k[..., self.rope_dim :]                         # [N, 2, 192]
-
-        # --- V path ---
-        v = self.v_proj(hidden_states)[0]                       # [N, 512]
-        v = v.view(*bs_seq, self.num_kv_heads, self.head_dim)   # [N, 2, 256]
 
         # --- flatten & concat ---
         k_rot_flat = k_rot.reshape(*bs_seq, -1)                 # [N, 128]
@@ -297,7 +332,17 @@ class Qwen3_6MLAImplMixin:
         return torch.cat((-x2, x1), dim=-1)
 
     def _apply_rope_neox(self, x, cos, sin):
-        """Apply GPT-NeoX style RoPE using cos/sin from attn_metadata."""
+        """Apply GPT-NeoX style RoPE using cos/sin from attn_metadata.
+
+        Uses the fused ``torch_npu.npu_rotary_mul`` op (``rotary_mode='half'``)
+        when the shape fits its constraints: its "half" mode computes exactly
+        ``x * cos + cat(-x2, x1) * sin`` in one kernel with fp32 accumulation
+        (verified bit-exact against the fp32 reference), replacing the
+        5-kernel PyTorch chain (mul / neg / cat / mul / add). Anything
+        unsupported — CPU tensors, non-4D layouts, prefill-sized token
+        batches (B must be < 1000), odd or oversized head dims, or an older
+        CANN without the op — falls back to the original chain.
+        """
         rd = self.qk_rope_head_dim
         cos_rd = cos[..., :rd]
         sin_rd = sin[..., :rd]
@@ -310,7 +355,20 @@ class Qwen3_6MLAImplMixin:
             cos_rd = cos_rd[: x.shape[0]]
             sin_rd = sin_rd[: x.shape[0]]
 
-        out = x * cos_rd + self._rotate_half(x) * sin_rd
+        if (
+            _HAS_NPU_ROTARY_MUL
+            and x.dim() == 4
+            and cos_rd.dim() == 4
+            and x.device.type == "npu"
+            and x.shape[-1] == rd
+            and rd % 2 == 0
+            and rd < _NPU_ROTARY_MUL_MAX_HEAD_DIM
+            and x.shape[0] < _NPU_ROTARY_MUL_MAX_BATCH_OR_HEADS
+            and x.shape[1] < _NPU_ROTARY_MUL_MAX_BATCH_OR_HEADS
+        ):
+            out = torch_npu.npu_rotary_mul(x, cos_rd, sin_rd, rotary_mode="half")
+        else:
+            out = x * cos_rd + self._rotate_half(x) * sin_rd
 
         if len(orig_shape) == 3:
             out = out.squeeze(2)
@@ -459,6 +517,12 @@ class Qwen3_6MLAImplMixin:
         del kv_b_proj_weight, W_UK, W_UV
         torch.npu.empty_cache()
 
+        # Fuse k_proj/v_proj into a single GEMM for the KV projection
+        # (no-op for quantized weights — the module keeps separate calls).
+        kv_a_with_mqa = self.kv_a_proj_with_mqa
+        if hasattr(kv_a_with_mqa, "merge_kv_weights"):
+            kv_a_with_mqa.merge_kv_weights()
+
     # ── Q/K split with RoPE-first layout (Qwen3 style) ────────────────
     # In Qwen3, the RoPE part is the FIRST qk_rope_head_dim dims of each head,
     # not the last. DeepSeek MLA assumes RoPE is last.  We override the
@@ -480,12 +544,11 @@ class Qwen3_6MLAImplMixin:
         # Qwen3 layout: q[:qk_rope_head_dim] = rope, q[qk_rope_head_dim:] = nope
         q_pe = q[..., : self.qk_rope_head_dim]
         q_nope = q[..., self.qk_rope_head_dim :]
-        # Convert from (B, N, P) to (N, B, P)
-        q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
-        return ql_nope.transpose(0, 1), q_pe
+        # Broadcast (B, N, 1, P) x (N, P, L) -> (B, N, 1, L): the result lands
+        # directly in the batch-major layout _forward_decode expects, so the
+        # transposed bmm and its downstream .contiguous() copy disappear.
+        ql_nope = torch.matmul(q_nope.unsqueeze(2), self.W_UK_T)
+        return ql_nope, q_pe
 
     def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata):
         from vllm_ascend.attention.mla_v1 import PrefillMLAPreprocessResult
