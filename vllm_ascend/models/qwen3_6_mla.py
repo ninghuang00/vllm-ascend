@@ -228,6 +228,17 @@ class Qwen3_6QProj(nn.Module):
         self._head_dim = head_dim
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor]:
+        q_flat, _ = self.forward_q_and_gate(hidden_states)
+        return (q_flat,)
+
+    def forward_q_and_gate(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute query and gate from a single fused ``qg_proj`` GEMM.
+
+        The gate is the per-head second half of the interleaved qg_proj
+        output. Returning both from one GEMM avoids a second full qg_proj
+        call for the gate in ``Qwen3_6MLAImplMixin.forward`` (the query is
+        then obtained by slicing the returned tensor along the token dim).
+        """
         q_and_gate = self.qg_proj(hidden_states)[0]
         # Output is interleaved: [h0_q(256), h0_g(256), h1_q(256), h1_g(256), ...]
         # After TP sharding: [h0_q, h0_g, h1_q, h1_g, ...] for local heads
@@ -236,22 +247,18 @@ class Qwen3_6QProj(nn.Module):
         local_heads = q_and_gate.shape[-1] // block
         # Reshape to [tokens, local_heads, block] then split q/g
         qg = q_and_gate.view(-1, local_heads, block)
-        query = qg[..., : self._qk_head_dim]  # [tokens, heads, qk_head_dim]
-        # gate = qg[..., self._qk_head_dim:]  # not needed here
-        query = query.view(-1, local_heads, self.head_dim)
-        query = self.q_norm(query)
+        # qk_head_dim == head_dim for this model, so the q slice already has
+        # the [tokens, heads, head_dim] layout expected by q_norm.
+        query = self.q_norm(qg[..., : self._qk_head_dim])
+        gate = qg[..., self._qk_head_dim :]  # [tokens, heads, head_dim]
         return (
             query.reshape(-1, local_heads * self.qk_head_dim),
+            gate.reshape(-1, local_heads * self._head_dim),
         )
 
     def get_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Return the gate tensor [N, local_heads * head_dim]."""
-        q_and_gate = self.qg_proj(hidden_states)[0]
-        block = self._qk_head_dim + self._head_dim  # 512
-        local_heads = q_and_gate.shape[-1] // block
-        qg = q_and_gate.view(-1, local_heads, block)
-        gate = qg[..., self._qk_head_dim:]  # [tokens, heads, head_dim]
-        return gate.reshape(-1, local_heads * self._head_dim)
+        return self.forward_q_and_gate(hidden_states)[1]
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -274,6 +281,13 @@ class Qwen3_6MLAImplMixin:
           from the per-kv-head ``kv_b_proj``, broadcasting to all query-heads.
         * ``forward`` — apply the output gate (``sigmoid(gate)``) before o_proj.
     """
+
+    # Per-forward stash of the fused q+gate projection: set in ``forward``,
+    # consumed by ``_q_proj_and_k_up_proj`` (decode range) and
+    # ``mla_preprocess_prefill`` (prefill range), cleared right after
+    # ``_mla_preprocess`` returns. Avoids running ``qg_proj`` twice per layer.
+    _precomputed_q_flat: torch.Tensor | None = None
+    _precomputed_q_num_decode_tokens: int = 0
 
     @staticmethod
     def _rotate_half(x):
@@ -324,14 +338,28 @@ class Qwen3_6MLAImplMixin:
         # RoPE on k_pe — use GPT-NeoX style (rotate_half), NOT npu_interleave_rope
         k_pe = self._apply_rope_neox(k_pe, cos, sin)
 
-        # Paged-cache scatter
-        block_size = kv_cache[0].shape[1]
-        block_idx = (slots // block_size).long()
-        block_off = (slots % block_size).long()
         kv_c_sq = kv_c.squeeze(2)   # [B, N, kv_lora_rank]
         k_pe_sq = k_pe.squeeze(2)  # [B, N, rope_dim]
-        kv_cache[0][block_idx, block_off] = kv_c_sq
-        kv_cache[1][block_idx, block_off] = k_pe_sq
+        # Paged-cache scatter. The fused aclnn op derives the block index
+        # internally from the flat slot ids, replacing the per-layer
+        # floor_div/floor_mod + index_put chain (one op instead of ~8).
+        # Only used for the default Norm (ND) cache layout; the NZ layout
+        # falls back to the original index_put path.
+        if not getattr(self, "enable_kv_nz", False):
+            torch_npu.npu_scatter_pa_kv_cache(
+                key=kv_c_sq.contiguous(),
+                value=k_pe_sq.contiguous(),
+                key_cache=kv_cache[0],
+                value_cache=kv_cache[1],
+                slot_mapping=slots.contiguous(),
+                cache_mode="Norm",
+            )
+        else:
+            block_size = kv_cache[0].shape[1]
+            block_idx = (slots // block_size).long()
+            block_off = (slots % block_size).long()
+            kv_cache[0][block_idx, block_off] = kv_c_sq
+            kv_cache[1][block_idx, block_off] = k_pe_sq
 
         # Return the full cache tensors (not single-token slices) so that
         # _forward_decode can view them as [num_blocks, block_size, num_kv_heads, dim].
@@ -442,7 +470,13 @@ class Qwen3_6MLAImplMixin:
         return self._apply_rope_neox(x, cos, sin).view(B, N, D)
 
     def _q_proj_and_k_up_proj(self, x):
-        q = self.q_proj(x)[0].view(-1, self.num_heads, self.qk_head_dim)
+        if self._precomputed_q_flat is not None:
+            # Reuse the fused q+gate GEMM from forward(): this call site is
+            # the decode-token range [0, num_decode_tokens).
+            q_flat = self._precomputed_q_flat[: self._precomputed_q_num_decode_tokens]
+        else:
+            q_flat = self.q_proj(x)[0]
+        q = q_flat.view(-1, self.num_heads, self.qk_head_dim)
         # Qwen3 layout: q[:qk_rope_head_dim] = rope, q[qk_rope_head_dim:] = nope
         q_pe = q[..., : self.qk_rope_head_dim]
         q_nope = q[..., self.qk_rope_head_dim :]
@@ -459,7 +493,13 @@ class Qwen3_6MLAImplMixin:
         num_actual_tokens = attn_metadata.num_actual_tokens
         prefill_kv_no_split = kv_no_split[num_decode_tokens:num_actual_tokens]
         prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
-        prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+        if self._precomputed_q_flat is not None:
+            # Reuse the fused q+gate GEMM from forward(): prefill range is
+            # [num_decode_tokens, num_actual_tokens).
+            prefill_q_flat = self._precomputed_q_flat[self._precomputed_q_num_decode_tokens :]
+        else:
+            prefill_q_flat = self.q_proj(prefill_q_c)[0]
+        prefill_q = prefill_q_flat.view(-1, self.num_heads, self.qk_head_dim)
         # Qwen3 layout: rope first, nope second
         prefill_q_pe = prefill_q[..., : self.qk_rope_head_dim]
         prefill_q_nope = prefill_q[..., self.qk_rope_head_dim :]
@@ -693,23 +733,26 @@ class Qwen3_6MLAImplMixin:
             _EXTRA_CTX.num_tokens,
             self.num_heads * self.v_head_dim,
         )
-        o_proj_input = torch.zeros(
-            o_proj_input_shape,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
 
-        # ── Compute gate ──
+        # ── Fused q + gate projection (single qg_proj GEMM) ──
+        # Compute query and gate together once; the decode/prefill
+        # preprocessing below slices the query from this tensor instead of
+        # running qg_proj a second time.
         hs_gathered = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             hidden_states.contiguous(), need_gather_q_kv
         )
-        gate = self.q_proj.get_gate(hs_gathered[:num_actual_tokens])
+        q_flat, gate = self.q_proj.forward_q_and_gate(hs_gathered[:num_actual_tokens])
+        self._precomputed_q_flat = q_flat
+        self._precomputed_q_num_decode_tokens = num_decode_tokens
 
         # ── MLA Preprocess ──
         decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
             layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
         )
+        # The stash is only valid inside _mla_preprocess of this forward call.
+        self._precomputed_q_flat = None
 
+        output_decode = None
         if decode_preprocess_res is not None:
             output_decode = self._forward_decode(
                 decode_preprocess_res.ql_nope,
@@ -720,8 +763,8 @@ class Qwen3_6MLAImplMixin:
                 attn_metadata,
                 getattr(decode_preprocess_res, "dequant_scale_q_nope", None),
             )
-            o_proj_input[:num_decode_tokens] = output_decode
 
+        output_prefill = None
         if prefill_preprocess_res is not None:
             output_prefill = self._forward_prefill(
                 prefill_preprocess_res.q_nope,
@@ -732,13 +775,33 @@ class Qwen3_6MLAImplMixin:
                 kv_cache,
                 attn_metadata,
             )
-            o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
 
-        # ── Apply gate before o_proj ──
+        # ── Assemble o_proj input, applying the gate before o_proj ──
         gate = gate.view(num_actual_tokens, self.num_heads * self.v_head_dim)
-        o_proj_input[:num_actual_tokens] = (
-            o_proj_input[:num_actual_tokens] * torch.sigmoid(gate)
-        )
+        gate_scale = torch.sigmoid(gate)
+        if (
+            output_prefill is None
+            and output_decode is not None
+            and num_actual_tokens == num_decode_tokens
+            and o_proj_input_shape[0] == num_actual_tokens
+        ):
+            # Pure decode step without graph padding: build the o_proj input
+            # directly, skipping the zero-initialized buffer and the slice
+            # copies.
+            o_proj_input = output_decode * gate_scale
+        else:
+            o_proj_input = torch.zeros(
+                o_proj_input_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            if output_decode is not None:
+                o_proj_input[:num_decode_tokens] = output_decode
+            if output_prefill is not None:
+                o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+            o_proj_input[:num_actual_tokens] = (
+                o_proj_input[:num_actual_tokens] * gate_scale
+            )
 
         # ── O proj ──
         output[...] = self.o_proj(
