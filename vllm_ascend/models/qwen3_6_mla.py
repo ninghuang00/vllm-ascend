@@ -58,6 +58,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from vllm.triton_utils import HAS_TRITON
 
 # NOTE: vllm_ascend.attention.* imports are done lazily (inside methods) to
 # avoid a circular-import chain: mla_v1 → attention_v1 → device_op →
@@ -159,6 +160,28 @@ class Qwen3_6KVProjWithMQA(nn.Module):
 
         # --- K+V in a single matmul ---
         kv = self.kv_proj(hidden_states)[0]                    # [N, 1024]
+
+        kv_concat = self._knorm_rearrange(kv)
+        out = self.kv_a_proj(kv_concat)                          # [N, 576]
+        return (out,)
+
+    def _knorm_rearrange(self, kv: torch.Tensor) -> torch.Tensor:
+        """K GemmaRMSNorm + [k_rot | k_pass | v] rearrangement.
+
+        Fused into a single Triton kernel when available (bf16); otherwise
+        falls back to the unfused eager path (norm + slices + concat).
+        """
+        if HAS_TRITON and kv.dtype == torch.bfloat16:
+            return torch.ops.vllm.triton_fused_knorm_rearrange(
+                kv,
+                self.k_norm.weight,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rope_dim,
+                self.k_norm.variance_epsilon,
+            )[0]
+
+        bs_seq = kv.shape[:-1]
         k, v = kv.split(
             [self.num_kv_heads * self.head_dim,
              self.num_kv_heads * self.head_dim], dim=-1
@@ -176,11 +199,9 @@ class Qwen3_6KVProjWithMQA(nn.Module):
         # --- flatten & concat ---
         k_rot_flat = k_rot.reshape(*bs_seq, -1)                 # [N, 128]
         k_pass_flat = k_pass.reshape(*bs_seq, -1)               # [N, 384]
-        v_flat = v.reshape(*bs_seq, -1)                         # [N, 512]
+        v_flat = v.reshape(*bs_seq, -1)                          # [N, 512]
 
-        kv_concat = torch.cat([k_rot_flat, k_pass_flat, v_flat], dim=-1)  # [N, 1024]
-        out = self.kv_a_proj(kv_concat)                          # [N, 576]
-        return (out,)
+        return torch.cat([k_rot_flat, k_pass_flat, v_flat], dim=-1)  # [N, 1024]
 
 
 class Qwen3_6QProj(nn.Module):
@@ -282,7 +303,46 @@ class Qwen3_6MLAImplMixin:
         * ``process_weights_after_loading`` — extract ``W_UK_T`` / ``W_UV``
           from the per-kv-head ``kv_b_proj``, broadcasting to all query-heads.
         * ``forward`` — apply the output gate (``sigmoid(gate)``) before o_proj.
+        * ``_mla_preprocess`` / ``mla_preprocess_decode`` /
+          ``mla_preprocess_prefill`` — when the fused Triton kernels are
+          available, run the Q norm+NeoX-rope+split+gate and the KV
+          rope+split+cache-scatter inside a single
+          ``triton_fused_mla_rope_scatter_split`` call per sub-batch
+          (bit-exact with the eager path; see
+          ``vllm_ascend/ops/triton/linearnorm/fused_mla_preprocess.py``).
     """
+
+    # ── fused MLA preprocess (7.2) ────────────────────────────────────
+    def _fused_mla_preprocess_enabled(self) -> bool:
+        """Whether the fused Q/KV preprocess kernel can replace the eager
+        fragment ops. Falls back to the eager path for setups the fused
+        kernel does not cover (no Triton, non-bf16, NZ cache format,
+        fa-quant, MLAPO head expansion)."""
+        return (
+            HAS_TRITON
+            and not self.enable_kv_nz
+            and not self.fa_quant_layer
+            and getattr(self, "mlapo_num_heads", self.num_heads) <= self.num_heads
+            and self.dtype == torch.bfloat16
+        )
+
+    def _fused_rope_scatter_split(self, qg, kv_no_split, cos, sin, slots, kv_cache, gate_out):
+        return torch.ops.vllm.triton_fused_mla_rope_scatter_split(
+            qg,
+            self.q_proj.q_norm.weight,
+            kv_no_split,
+            cos,
+            sin,
+            slots,
+            kv_cache[0],
+            kv_cache[1],
+            gate_out,
+            self.num_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.qk_head_dim,
+            self.q_proj.q_norm.variance_epsilon,
+        )
 
     @staticmethod
     def _rotate_half(x):
@@ -380,6 +440,40 @@ class Qwen3_6MLAImplMixin:
         # should only process the prefill tokens, not the entire cache.
         return k_pe, kv_c
 
+    # ── decode preprocess (fused 7.2 path) ────────────────────────────
+    def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
+        """Fused variant: one triton_fused_mla_rope_scatter_split call covers
+        Q norm + NeoX rope + q_pe/q_nope split + gate copy + KV rope/split +
+        paged-cache scatter for all decode tokens."""
+        if getattr(self, "_precomputed_qg", None) is None:
+            return super().mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
+
+        from vllm_ascend.attention.mla_v1 import DecodeMLAPreprocessResult
+
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        cos = attn_metadata.decode.cos
+        sin = attn_metadata.decode.sin
+        decode_slots = attn_metadata.slot_mapping[:num_decode_tokens]
+        decode_q_pe, decode_q_nope, _, _ = self._fused_rope_scatter_split(
+            self._precomputed_qg[:num_decode_tokens],
+            kv_no_split[:num_decode_tokens],
+            cos,
+            sin,
+            decode_slots,
+            kv_cache,
+            self._precomputed_gate[:num_decode_tokens],
+        )
+        # weight absorption on the pre-split q_nope (same bmm as
+        # _q_proj_and_k_up_proj, minus the redundant slice)
+        decode_ql_nope = torch.bmm(
+            decode_q_nope.transpose(0, 1), self.W_UK_T
+        ).transpose(0, 1)
+        # cache scatter already done inside the kernel; hand the full paged
+        # caches to _forward_decode exactly like exec_kv_decode does
+        return DecodeMLAPreprocessResult(
+            decode_ql_nope, decode_q_pe, kv_cache[0], kv_cache[1]
+        )
+
     # ── weight absorption setup ───────────────────────────────────────
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
@@ -467,6 +561,36 @@ class Qwen3_6MLAImplMixin:
         num_actual_tokens = attn_metadata.num_actual_tokens
         prefill_kv_no_split = kv_no_split[num_decode_tokens:num_actual_tokens]
         prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
+
+        if getattr(self, "_precomputed_qg", None) is not None:
+            # ── fused 7.2 path: one kernel for Q norm/rope/split/gate +
+            # KV rope/split + cache scatter over the prefill sub-batch ──
+            cos = attn_metadata.prefill.cos
+            sin = attn_metadata.prefill.sin
+            prefill_slots = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+            prefill_q_pe, prefill_q_nope, prefill_kv_c, prefill_k_pe_ret = (
+                self._fused_rope_scatter_split(
+                    self._precomputed_qg[num_decode_tokens:num_actual_tokens],
+                    prefill_kv_no_split,
+                    cos,
+                    sin,
+                    prefill_slots,
+                    kv_cache,
+                    self._precomputed_gate[num_decode_tokens:num_actual_tokens],
+                )
+            )
+            prefill_k_nope, prefill_value = (
+                self.kv_b_proj(prefill_kv_c)[0]
+                .view(-1, self.num_kv_heads_original,
+                      self.qk_nope_head_dim + self.v_head_dim)
+                [:, self._kv_head_idx:self._kv_head_idx + 1]
+                .expand(-1, self.num_heads, -1)
+                .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            )
+            prefill_k_pe = prefill_k_pe_ret.view(prefill_q_c.shape[0], self.num_kv_heads, -1)
+            prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+            return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
+
         if getattr(self, "_precomputed_q", None) is not None:
             prefill_q = prefill_q_c.view(-1, self.num_heads, self.qk_head_dim)
         else:
@@ -496,7 +620,11 @@ class Qwen3_6MLAImplMixin:
                         attn_metadata, need_gather_q_kv):
         """Override to use pre-computed query from forward(), avoiding
         redundant qg_proj calls inside _q_proj_and_k_up_proj and
-        mla_preprocess_prefill."""
+        mla_preprocess_prefill.
+
+        When forward() stashed the raw ``qg_proj`` output (fused 7.2 path),
+        also allocate the gate buffer that the fused kernel fills in for
+        both the decode and prefill sub-batches."""
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
 
@@ -504,7 +632,16 @@ class Qwen3_6MLAImplMixin:
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv_no_split.contiguous(), need_gather_q_kv)
 
-        q_c = self._precomputed_q
+        if getattr(self, "_precomputed_qg", None) is not None:
+            q_c = self._precomputed_qg
+            self._precomputed_gate = torch.empty(
+                attn_metadata.num_actual_tokens,
+                self.num_heads * self.v_head_dim,
+                dtype=self._precomputed_qg.dtype,
+                device=self._precomputed_qg.device,
+            )
+        else:
+            q_c = self._precomputed_q
 
         decode_preprocess_res = None
         prefill_preprocess_res = None
@@ -863,14 +1000,29 @@ class Qwen3_6MLAImplMixin:
         hs_gathered = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             hidden_states.contiguous(), need_gather_q_kv
         )
-        query, gate = self.q_proj.forward_qg(hs_gathered[:num_actual_tokens])
-        self._precomputed_q = query
+        if self._fused_mla_preprocess_enabled():
+            # fused 7.2 path: keep the raw interleaved q|gate projection;
+            # norm/rope/split/gate extraction all happen inside
+            # triton_fused_mla_rope_scatter_split
+            self._precomputed_qg = self.q_proj.qg_proj(
+                hs_gathered[:num_actual_tokens]
+            )[0]
+            self._precomputed_q = None
+        else:
+            query, gate = self.q_proj.forward_qg(hs_gathered[:num_actual_tokens])
+            self._precomputed_q = query
+            self._precomputed_qg = None
 
         # ── MLA Preprocess (uses _precomputed_q, no redundant qg_proj) ──
         decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
             layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
         )
+
+        if self._precomputed_qg is not None:
+            gate = self._precomputed_gate
         self._precomputed_q = None
+        self._precomputed_qg = None
+        self._precomputed_gate = None
 
         if decode_preprocess_res is not None:
             output_decode = self._forward_decode(
