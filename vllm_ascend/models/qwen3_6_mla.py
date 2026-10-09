@@ -62,7 +62,9 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
 # NOTE: vllm_ascend.attention.* imports are done lazily (inside methods) to
 # avoid a circular-import chain: mla_v1 → attention_v1 → device_op →
 # ops.fused_moe → experts_selector → device_op.
-from vllm_ascend.memcache_comm_fence import record_attention_compute_start
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
+    record_attention_compute_start,
+)
 from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, maybe_trans_nz
 
@@ -544,11 +546,16 @@ class Qwen3_6MLAImplMixin:
         # Qwen3 layout: q[:qk_rope_head_dim] = rope, q[qk_rope_head_dim:] = nope
         q_pe = q[..., : self.qk_rope_head_dim]
         q_nope = q[..., self.qk_rope_head_dim :]
-        # Broadcast (B, N, 1, P) x (N, P, L) -> (B, N, 1, L): the result lands
-        # directly in the batch-major layout _forward_decode expects, so the
-        # transposed bmm and its downstream .contiguous() copy disappear.
-        ql_nope = torch.matmul(q_nope.unsqueeze(2), self.W_UK_T)
-        return ql_nope, q_pe
+        # Convert from (B, N, P) to (N, B, P). Passing the transposed view
+        # straight to bmm dispatches an efficient strided-batch GEMM
+        # (aclnnBatchMatMul, ~8us at decode shapes); a broadcast
+        # matmul((B,N,1,P), (N,P,L)) was measured 6x slower (~53us) and is
+        # deliberately NOT used here.
+        q_nope = q_nope.transpose(0, 1)
+        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+        ql_nope = torch.bmm(q_nope, self.W_UK_T)
+        # Convert from (N, B, L) to (B, N, L)
+        return ql_nope.transpose(0, 1), q_pe
 
     def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata):
         from vllm_ascend.attention.mla_v1 import PrefillMLAPreprocessResult

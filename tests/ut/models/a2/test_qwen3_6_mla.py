@@ -229,7 +229,7 @@ def test_kv_proj_merged_gemm_matches_separate(monkeypatch):
     assert torch.equal(out_merged, out_separate)
 
 
-def test_q_proj_and_k_up_proj_broadcast_matmul_matches_bmm():
+def test_q_proj_and_k_up_proj_bmm_matches_reference():
     torch.manual_seed(4)
     device = "npu"
     num_heads, qk_head_dim, rope_dim, lora_rank = 8, 256, 64, 512
@@ -251,14 +251,67 @@ def test_q_proj_and_k_up_proj_broadcast_matmul_matches_bmm():
 
     q = impl.q_proj.return_value[0].view(-1, num_heads, qk_head_dim)
     q_nope = q[..., rope_dim:]
-    ref = (
-        torch.bmm(q_nope.transpose(0, 1), impl.W_UK_T)
-        .transpose(0, 1)
-        .contiguous()
-        .view(64, num_heads, 1, lora_rank)
-    )
+    ref = torch.bmm(q_nope.transpose(0, 1), impl.W_UK_T).transpose(0, 1)
 
-    assert ql_nope.shape == (64, num_heads, 1, lora_rank)
-    assert ql_nope.is_contiguous()
+    assert ql_nope.shape == (64, num_heads, lora_rank)
     assert torch.equal(ql_nope, ref)
     assert torch.equal(q_pe, q[..., :rope_dim])
+
+
+# ── D8: NPU graph capture/replay safety of the decode-path ops ─────────
+
+
+def test_decode_path_ops_replay_identically_under_npu_graph():
+    """Capture exec_kv_decode + _q_proj_and_k_up_proj (fused rope, fused
+    scatter, broadcast matmul) into an NPU graph and verify the replay is
+    bit-identical to the eager run (decode runs under FULL_DECODE_ONLY
+    graphs in production)."""
+    torch.manual_seed(5)
+    torch.npu.manual_seed_all(5)
+    device = "npu"
+    num_tokens, num_heads, lora_rank, rope_dim = 64, 8, 512, 64
+    num_blocks, block_size = 8, 128
+
+    impl = _make_impl(lora_rank, rope_dim)
+    impl.num_heads = num_heads
+    impl.qk_head_dim = 256
+    impl.qk_nope_head_dim = 256 - rope_dim
+    impl.v_head_dim = 256
+    impl.W_UK_T = (
+        torch.randn(num_heads, 256 - rope_dim, lora_rank, dtype=torch.bfloat16, device=device) * 0.02
+    )
+
+    kv_no_split = torch.randn(num_tokens, lora_rank + rope_dim, dtype=torch.bfloat16, device=device)
+    cos = torch.rand(num_tokens, 1, 1, rope_dim, dtype=torch.bfloat16, device=device) * 2 - 1
+    sin = torch.rand(num_tokens, 1, 1, rope_dim, dtype=torch.bfloat16, device=device) * 2 - 1
+    slots = torch.randperm(num_blocks * block_size, device=device)[:num_tokens].to(torch.int64)
+    q_flat = torch.randn(num_tokens, num_heads * 256, dtype=torch.bfloat16, device=device)
+
+    def workload():
+        caches = (
+            torch.zeros(num_blocks, block_size, 1, lora_rank, dtype=torch.bfloat16, device=device),
+            torch.zeros(num_blocks, block_size, 1, rope_dim, dtype=torch.bfloat16, device=device),
+        )
+        impl.exec_kv_decode(kv_no_split, cos, sin, caches, slots)
+        impl._precomputed_q_flat = q_flat
+        impl._precomputed_q_num_decode_tokens = num_tokens
+        ql_nope, q_pe = impl._q_proj_and_k_up_proj(torch.empty(0))
+        impl._precomputed_q_flat = None
+        return ql_nope, q_pe
+
+    # Eager reference.
+    ref_ql, ref_qpe = workload()
+
+    g = torch.npu.NPUGraph()
+    side = torch.npu.Stream()
+    side.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(side):
+        workload()
+    torch.npu.current_stream().wait_stream(side)
+    with torch.npu.graph(g):
+        ql_nope, q_pe = workload()
+    g.replay()
+    torch.npu.synchronize()
+
+    assert torch.equal(ql_nope, ref_ql)
+    assert torch.equal(q_pe, ref_qpe)

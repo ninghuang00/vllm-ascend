@@ -181,11 +181,11 @@ def test_q_proj_and_k_up_proj_uses_stashed_decode_range():
 
     q = q_flat[:num_decode].view(-1, impl.num_heads, impl.qk_head_dim)
     q_pe_ref = q[..., : impl.qk_rope_head_dim]
-    q_nope_ref = q[..., impl.qk_rope_head_dim :]
-    # Reference: broadcast (B, N, 1, P) x (N, P, L) -> (B, N, 1, L)
-    ql_nope_ref = torch.matmul(q_nope_ref.unsqueeze(2), impl.W_UK_T)
+    q_nope_ref = q[..., impl.qk_rope_head_dim :].transpose(0, 1)
+    # Reference: bmm (N, B, P) x (N, P, L) -> (N, B, L), transposed back
+    ql_nope_ref = torch.bmm(q_nope_ref, impl.W_UK_T).transpose(0, 1)
 
-    assert ql_nope.shape == (num_decode, impl.num_heads, 1, impl.kv_lora_rank)
+    assert ql_nope.shape == (num_decode, impl.num_heads, impl.kv_lora_rank)
     assert torch.equal(ql_nope, ql_nope_ref)
     assert torch.equal(q_pe, q_pe_ref)
 
@@ -199,7 +199,7 @@ def test_q_proj_and_k_up_proj_falls_back_without_stash():
     ql_nope, q_pe = impl._q_proj_and_k_up_proj(x)
 
     impl.q_proj.assert_called_once_with(x)
-    assert ql_nope.shape == (4, impl.num_heads, 1, impl.kv_lora_rank)
+    assert ql_nope.shape == (4, impl.num_heads, impl.kv_lora_rank)
 
 
 def test_mla_preprocess_prefill_uses_stashed_prefill_range():
