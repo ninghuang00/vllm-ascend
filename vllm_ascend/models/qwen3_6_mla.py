@@ -107,15 +107,16 @@ _NPU_ROTARY_MUL_MAX_HEAD_DIM = 896
 _NPU_ROTARY_MUL_MAX_BATCH_OR_HEADS = 1000
 _HAS_NPU_ROTARY_MUL = hasattr(torch_npu, "npu_rotary_mul")
 
-# Lazily resolved binding to the fused Qwen36KvNormPermute custom aclnn op
-# (built via the cann-ops-transformer aclnn flow, dav-c220-vec target).
-# Falls back to the Python GemmaRMSNorm + cat chain when unavailable.
+# Lazily resolved bindings to the fused Qwen3.6 custom aclnn ops (built via
+# the cann-ops-transformer aclnn flow, dav-c220-vec target). Fall back to the
+# Python chains when unavailable.
 _FUSED_KV_NORM_PERMUTE = None
+_FUSED_KV_ROPE_SCATTER = None
 _FUSED_KV_NORM_PERMUTE_PROBED = False
 
 
 def _try_load_fused_kv_norm_permute():
-    global _FUSED_KV_NORM_PERMUTE, _FUSED_KV_NORM_PERMUTE_PROBED
+    global _FUSED_KV_NORM_PERMUTE, _FUSED_KV_ROPE_SCATTER, _FUSED_KV_NORM_PERMUTE_PROBED
     if _FUSED_KV_NORM_PERMUTE_PROBED:
         return
     _FUSED_KV_NORM_PERMUTE_PROBED = True
@@ -123,8 +124,10 @@ def _try_load_fused_kv_norm_permute():
         import qwen36_ops  # noqa: F401
 
         _FUSED_KV_NORM_PERMUTE = qwen36_ops.kv_norm_permute
+        _FUSED_KV_ROPE_SCATTER = qwen36_ops.kv_rope_scatter
     except ImportError:
         _FUSED_KV_NORM_PERMUTE = None
+        _FUSED_KV_ROPE_SCATTER = None
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -425,6 +428,50 @@ class Qwen3_6MLAImplMixin:
         slots: torch.Tensor,
     ):
         B = kv_no_split.shape[0]
+
+        # --- Fused split + NeoX rope + dual paged scatter (single custom
+        # kernel, the norm-free npu_kv_rmsnorm_rope_cache equivalent). Only
+        # for the default Norm (ND) cache layout; everything else falls back
+        # to the original chain below.
+        if (
+            _FUSED_KV_ROPE_SCATTER is not None
+            and not getattr(self, "enable_kv_nz", False)
+            and kv_no_split.dim() == 2
+            # The Qwen36KvRopeScatter op contract is fixed at [N, 576] =
+            # [ckv(512) | k_pe(64)]; other MLA dims keep the fallback chain.
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and kv_no_split.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            and kv_no_split.is_contiguous()
+            and kv_no_split.dtype == torch.bfloat16
+            and kv_no_split.device.type == "npu"
+            and cos.dim() == 4
+            and cos.shape[0] >= B
+            and cos.shape[-1] >= self.qk_rope_head_dim
+            and cos.dtype == torch.bfloat16
+            and sin.dtype == torch.bfloat16
+            and slots.dtype in (torch.int32, torch.int64)
+            and kv_cache[0].dim() == 4
+            and kv_cache[0].shape[2] == 1
+            and kv_cache[0].shape[3] == self.kv_lora_rank
+            and kv_cache[1].dim() == 4
+            and kv_cache[1].shape[2] == 1
+            and kv_cache[1].shape[3] == self.qk_rope_head_dim
+            and kv_cache[0].shape[0:2] == kv_cache[1].shape[0:2]
+        ):
+            rd = self.qk_rope_head_dim
+            cos_rd = cos[:B, ..., :rd].reshape(B, rd)
+            sin_rd = sin[:B, ..., :rd].reshape(B, rd)
+            _FUSED_KV_ROPE_SCATTER(
+                kv_no_split,
+                cos_rd,
+                sin_rd,
+                slots.to(torch.int64),
+                kv_cache[0],
+                kv_cache[1],
+            )
+            return kv_cache[1], kv_cache[0]
+
         N = self.num_kv_heads  # 1 for MLA
         S = 1
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)

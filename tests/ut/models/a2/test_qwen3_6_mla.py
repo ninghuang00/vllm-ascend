@@ -412,3 +412,141 @@ def test_fused_op_graph_replay():
     g.replay()
     torch.npu.synchronize()
     assert torch.equal(out, ref)
+
+
+# ── Path A: fused Qwen36KvRopeScatter integration ─────────────────────
+
+
+def _rope_scatter_available() -> bool:
+    try:
+        import qwen36_ops
+
+        return hasattr(qwen36_ops, "kv_rope_scatter")
+    except ImportError:
+        return False
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 64, 320])
+def test_exec_kv_decode_fused_rope_scatter_matches_index_put(num_tokens):
+    """The fused exec_kv_decode branch (Qwen36KvRopeScatter) must be
+    bit-exact against the fp32-rope + index_put reference."""
+    if not _rope_scatter_available():
+        pytest.skip("qwen36_ops.kv_rope_scatter not importable")
+    torch.manual_seed(3)
+    torch.npu.manual_seed_all(3)
+    device = "npu"
+    num_blocks, block_size = 8, 128
+
+    from vllm_ascend.models import qwen3_6_mla as m
+
+    m._try_load_fused_kv_norm_permute()
+    assert m._FUSED_KV_ROPE_SCATTER is not None
+
+    impl = _make_impl(512, 64)
+    kv_no_split = torch.randn(num_tokens, 576, dtype=torch.bfloat16, device=device)
+    cos = torch.randn(num_tokens, 1, 1, 64, dtype=torch.bfloat16, device=device)
+    sin = torch.randn(num_tokens, 1, 1, 64, dtype=torch.bfloat16, device=device)
+    slots = torch.randperm(num_blocks * block_size, device=device)[:num_tokens].to(torch.int64)
+
+    fused_caches = (
+        torch.zeros(num_blocks, block_size, 1, 512, dtype=torch.bfloat16, device=device),
+        torch.zeros(num_blocks, block_size, 1, 64, dtype=torch.bfloat16, device=device),
+    )
+    ret_k_pe_cache, ret_kv_c_cache = impl.exec_kv_decode(kv_no_split, cos, sin, fused_caches, slots)
+    assert ret_k_pe_cache is fused_caches[1]
+    assert ret_kv_c_cache is fused_caches[0]
+
+    # fp32 reference: NeoX-half rope + index_put scatter.
+    x = kv_no_split[:, 512:].float()
+    c = cos.reshape(num_tokens, 64).float()
+    s = sin.reshape(num_tokens, 64).float()
+    rh = torch.cat([-x[:, 32:], x[:, :32]], dim=-1)
+    pe = (x * c + rh * s).to(torch.bfloat16)
+    block_idx = (slots // block_size).long()
+    block_off = (slots % block_size).long()
+    ref_ckv = torch.zeros_like(fused_caches[0])
+    ref_kpe = torch.zeros_like(fused_caches[1])
+    ref_ckv[block_idx, block_off, 0] = kv_no_split[:, :512]
+    ref_kpe[block_idx, block_off, 0] = pe
+
+    torch.npu.synchronize()
+    assert torch.equal(fused_caches[0], ref_ckv)
+    assert torch.equal(fused_caches[1], ref_kpe)
+
+
+def test_exec_kv_decode_fused_rope_scatter_matches_fallback_chain():
+    """Fused branch vs the original split/rope/scatter chain on the same
+    inputs: cache contents must be identical."""
+    if not _rope_scatter_available():
+        pytest.skip("qwen36_ops.kv_rope_scatter not importable")
+    torch.manual_seed(4)
+    device = "npu"
+    num_blocks, block_size = 8, 128
+    num_tokens = 64
+
+    from vllm_ascend.models import qwen3_6_mla as m
+
+    m._try_load_fused_kv_norm_permute()
+    saved = m._FUSED_KV_ROPE_SCATTER
+    try:
+        m._FUSED_KV_ROPE_SCATTER = None  # force fallback
+        kv = torch.randn(num_tokens, 576, dtype=torch.bfloat16, device=device)
+        cos = torch.randn(num_tokens, 1, 1, 64, dtype=torch.bfloat16, device=device)
+        sin = torch.randn(num_tokens, 1, 1, 64, dtype=torch.bfloat16, device=device)
+        slots = torch.randperm(num_blocks * block_size, device=device)[:num_tokens].to(torch.int64)
+        ref_caches = (
+            torch.zeros(num_blocks, block_size, 1, 512, dtype=torch.bfloat16, device=device),
+            torch.zeros(num_blocks, block_size, 1, 64, dtype=torch.bfloat16, device=device),
+        )
+        impl = _make_impl(512, 64)
+        impl.exec_kv_decode(kv, cos, sin, ref_caches, slots)
+
+        m._FUSED_KV_ROPE_SCATTER = saved  # fused
+        fused_caches = (
+            torch.zeros(num_blocks, block_size, 1, 512, dtype=torch.bfloat16, device=device),
+            torch.zeros(num_blocks, block_size, 1, 64, dtype=torch.bfloat16, device=device),
+        )
+        impl.exec_kv_decode(kv, cos, sin, fused_caches, slots)
+        torch.npu.synchronize()
+        assert torch.equal(fused_caches[0], ref_caches[0])
+        assert torch.equal(fused_caches[1], ref_caches[1])
+    finally:
+        m._FUSED_KV_ROPE_SCATTER = saved
+
+
+def test_kv_rope_scatter_graph_replay():
+    """The Qwen36KvRopeScatter aclnn call must be NPU-graph-capturable and
+    replay-identical."""
+    if not _rope_scatter_available():
+        pytest.skip("qwen36_ops.kv_rope_scatter not importable")
+    torch.manual_seed(5)
+    device = "npu"
+    import qwen36_ops
+
+    num_blocks, block_size, num_tokens = 8, 128, 64
+    kv = torch.randn(num_tokens, 576, dtype=torch.bfloat16, device=device)
+    cos = torch.randn(num_tokens, 64, dtype=torch.bfloat16, device=device)
+    sin = torch.randn(num_tokens, 64, dtype=torch.bfloat16, device=device)
+    slots = torch.randperm(num_blocks * block_size, device=device)[:num_tokens].to(torch.int64)
+    eager_caches = (
+        torch.zeros(num_blocks, block_size, 1, 512, dtype=torch.bfloat16, device=device),
+        torch.zeros(num_blocks, block_size, 1, 64, dtype=torch.bfloat16, device=device),
+    )
+    qwen36_ops.kv_rope_scatter(kv, cos, sin, slots, *eager_caches)
+
+    g = torch.npu.NPUGraph()
+    side = torch.npu.Stream()
+    side.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(side):
+        qwen36_ops.kv_rope_scatter(kv, cos, sin, slots, *eager_caches)
+    torch.npu.current_stream().wait_stream(side)
+    graph_caches = (
+        torch.zeros(num_blocks, block_size, 1, 512, dtype=torch.bfloat16, device=device),
+        torch.zeros(num_blocks, block_size, 1, 64, dtype=torch.bfloat16, device=device),
+    )
+    with torch.npu.graph(g):
+        qwen36_ops.kv_rope_scatter(kv, cos, sin, slots, *graph_caches)
+    g.replay()
+    torch.npu.synchronize()
+    assert torch.equal(graph_caches[0], eager_caches[0])
+    assert torch.equal(graph_caches[1], eager_caches[1])
