@@ -107,6 +107,25 @@ _NPU_ROTARY_MUL_MAX_HEAD_DIM = 896
 _NPU_ROTARY_MUL_MAX_BATCH_OR_HEADS = 1000
 _HAS_NPU_ROTARY_MUL = hasattr(torch_npu, "npu_rotary_mul")
 
+# Lazily resolved binding to the fused Qwen36KvNormPermute custom aclnn op
+# (built via the cann-ops-transformer aclnn flow, dav-c220-vec target).
+# Falls back to the Python GemmaRMSNorm + cat chain when unavailable.
+_FUSED_KV_NORM_PERMUTE = None
+_FUSED_KV_NORM_PERMUTE_PROBED = False
+
+
+def _try_load_fused_kv_norm_permute():
+    global _FUSED_KV_NORM_PERMUTE, _FUSED_KV_NORM_PERMUTE_PROBED
+    if _FUSED_KV_NORM_PERMUTE_PROBED:
+        return
+    _FUSED_KV_NORM_PERMUTE_PROBED = True
+    try:
+        import qwen36_ops  # noqa: F401
+
+        _FUSED_KV_NORM_PERMUTE = qwen36_ops.kv_norm_permute
+    except ImportError:
+        _FUSED_KV_NORM_PERMUTE = None
+
 
 # ════════════════════════════════════════════════════════════════════
 #  1.  Custom modules
@@ -187,6 +206,8 @@ class Qwen3_6KVProjWithMQA(nn.Module):
         self._merged_kv_weight = torch.cat(
             [self.k_proj.weight, self.v_proj.weight], dim=0
         ).contiguous()
+        # Probe the fused Qwen36KvNormPermute extension once at load time.
+        _try_load_fused_kv_norm_permute()
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor]:
         bs_seq = hidden_states.shape[:-1]
@@ -195,6 +216,26 @@ class Qwen3_6KVProjWithMQA(nn.Module):
         if self._merged_kv_weight is not None:
             # [N, 2 * num_kv_heads * head_dim] laid out as [k(512) | v(512)]
             kv = torch.nn.functional.linear(hidden_states, self._merged_kv_weight)
+
+            # --- Fused norm + permute (single custom kernel) ---
+            # Replaces GemmaRMSNorm(k) + [rot|pass|v] cat with one
+            # Qwen36KvNormPermute aclnn op; falls back to the Python chain
+            # when the extension or the custom op package is unavailable.
+            if (
+                _FUSED_KV_NORM_PERMUTE is not None
+                and kv.dim() == 2
+                and kv.shape[-1] == 2 * self.num_kv_heads * self.head_dim
+                and kv.is_contiguous()
+                and kv.device.type == "npu"
+                and kv.dtype == torch.bfloat16
+                and self.k_norm.weight.dtype == torch.bfloat16
+            ):
+                kv_a_in = _FUSED_KV_NORM_PERMUTE(
+                    kv, self.k_norm.weight, self.k_norm.variance_epsilon
+                )
+                out = self.kv_a_proj(kv_a_in)                   # [N, 576]
+                return (out,)
+
             kv = kv.view(*bs_seq, 2 * self.num_kv_heads, self.head_dim)
             k = kv[..., : self.num_kv_heads, :]
             v = kv[..., self.num_kv_heads :, :]
@@ -204,7 +245,7 @@ class Qwen3_6KVProjWithMQA(nn.Module):
             k = k.view(*bs_seq, self.num_kv_heads, self.head_dim)
             v = v.view(*bs_seq, self.num_kv_heads, self.head_dim)
 
-        # --- K norm + rot/pass split ---
+        # --- K norm + rot/pass split (fallback chain) ---
         k = self.k_norm(k)                                       # RMSNorm on 256
         k_rot = k[..., : self.rope_dim]                          # [N, 2, 64]
         k_pass = k[..., self.rope_dim :]                         # [N, 2, 192]

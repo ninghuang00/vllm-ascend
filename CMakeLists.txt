@@ -68,6 +68,23 @@ if(SOC_VERSION MATCHES "ascend950")
     list(REMOVE_ITEM VLLM_ASCEND_CUSTOM_OP ${VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950})
 endif()
 
+# The mla_preprocess AscendC kernel requires C220-class AscendC features
+# (bfloat16_t device type); it does not compile on dav-m200 targets
+# (ascend910b*, where __CCE_AICORE__ == 200 and the bfloat16_t typedef in
+# __clang_cce_types.h is not defined). Only build it where it is both
+# compilable and consumed: ascend910_9392 (A3). The torch binding for the
+# op is guarded by the matching VLLM_ASCEND_MLA_PREPROCESS_AVAILABLE define.
+set(VLLM_ASCEND_MLA_PREPROCESS_SUPPORTED OFF)
+if(SOC_VERSION MATCHES "ascend910_9392")
+    set(VLLM_ASCEND_MLA_PREPROCESS_SUPPORTED ON)
+endif()
+if(NOT VLLM_ASCEND_MLA_PREPROCESS_SUPPORTED)
+    list(REMOVE_ITEM VLLM_ASCEND_CUSTOM_OP ${VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950})
+    if(NOT (SOC_VERSION MATCHES "ascend950|ascend310p.*"))
+        message(STATUS "Hardware ${SOC_VERSION} lacks C220 AscendC (bfloat16_t): mla_preprocess kernel excluded")
+    endif()
+endif()
+
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
     message(STATUS "Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels compile")
 else()
@@ -153,6 +170,10 @@ endif()
 
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
+endif()
+
+if(VLLM_ASCEND_MLA_PREPROCESS_SUPPORTED)
+    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ASCEND_MLA_PREPROCESS_AVAILABLE)
 endif()
 
 target_link_directories(

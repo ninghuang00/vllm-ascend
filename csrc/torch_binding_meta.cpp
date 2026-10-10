@@ -1963,8 +1963,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand
     ops.impl("sgmv_expand", &vllm_ascend::meta::sgmv_expand_meta);
-    // MLA preprocess
+#ifdef VLLM_ASCEND_MLA_PREPROCESS_AVAILABLE
+    // MLA preprocess (kernel excluded on non-C220 targets, e.g. ascend910b)
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
+#endif
 #endif
     // grouped_matmul_swiglu_quant_weight_nz meta implementation
     ops.impl("grouped_matmul_swiglu_quant_weight_nz", &vllm_ascend::meta::grouped_matmul_swiglu_quant);

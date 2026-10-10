@@ -315,3 +315,100 @@ def test_decode_path_ops_replay_identically_under_npu_graph():
 
     assert torch.equal(ql_nope, ref_ql)
     assert torch.equal(q_pe, ref_qpe)
+
+
+# ── Path B: fused Qwen36KvNormPermute integration ─────────────────────
+
+def _kv_norm_permute_reference(kv: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
+    """fp32 GemmaRMSNorm(k) + [rot|pass|v] permute reference."""
+    N = kv.shape[0]
+    k = kv[:, :512].float().view(N, 2, 256)
+    gamma_f = gamma.float() + 1.0
+    out = torch.empty(N, 1024, dtype=torch.bfloat16, device=kv.device)
+    for h in range(2):
+        x = k[:, h, :]
+        rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        kn = (x * rstd * gamma_f.unsqueeze(0)).to(torch.bfloat16)
+        if h == 0:
+            out[:, 0:64] = kn[:, 0:64]
+            out[:, 128:320] = kn[:, 64:256]
+        else:
+            out[:, 64:128] = kn[:, 0:64]
+            out[:, 320:512] = kn[:, 64:256]
+    out[:, 512:1024] = kv[:, 512:1024]
+    return out
+
+
+def _fused_op_available() -> bool:
+    try:
+        import qwen36_ops  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 64, 320])
+def test_kv_proj_forward_fused_matches_python_chain(num_tokens, monkeypatch):
+    """The fused branch of Qwen3_6KVProjWithMQA.forward (merged GEMM +
+    Qwen36KvNormPermute) must match the fallback Python chain bit-exact."""
+    if not _fused_op_available():
+        pytest.skip("qwen36_ops extension not importable")
+    monkeypatch.setattr(qwen3_6_mla, "ReplicatedLinear", _StubReplicatedLinear)
+    torch.manual_seed(6)
+    device = "npu"
+    module = Qwen3_6KVProjWithMQA(
+        hidden_size=2048,
+        num_kv_heads=2,
+        head_dim=256,
+        rope_dim=64,
+        kv_lora_rank=512,
+        rms_norm_eps=1e-6,
+    ).npu()
+    # Cast to bf16 to match the production dtype contract of the fused op.
+    module.k_norm.weight.data = module.k_norm.weight.data.to(torch.bfloat16)
+    module.kv_a_proj.weight.data = module.kv_a_proj.weight.data.to(torch.bfloat16)
+    module.merge_kv_weights()
+    assert module._merged_kv_weight is not None
+    from vllm_ascend.models import qwen3_6_mla as m
+
+    m._try_load_fused_kv_norm_permute()
+    assert m._FUSED_KV_NORM_PERMUTE is not None
+
+    hidden = torch.randn(num_tokens, 2048, dtype=torch.bfloat16, device=device)
+    out_fused = module(hidden)[0]
+
+    # Force the fallback chain by temporarily clearing the binding.
+    saved = m._FUSED_KV_NORM_PERMUTE
+    m._FUSED_KV_NORM_PERMUTE = None
+    try:
+        out_ref = module(hidden)[0]
+    finally:
+        m._FUSED_KV_NORM_PERMUTE = saved
+
+    assert out_fused.shape == out_ref.shape
+    assert torch.equal(out_fused, out_ref)
+
+
+def test_fused_op_graph_replay():
+    """The Qwen36KvNormPermute aclnn call must be NPU-graph-capturable."""
+    if not _fused_op_available():
+        pytest.skip("qwen36_ops extension not importable")
+    torch.manual_seed(7)
+    device = "npu"
+    import qwen36_ops
+
+    kv = torch.randn(64, 1024, dtype=torch.bfloat16, device=device)
+    gamma = torch.randn(256, dtype=torch.bfloat16, device=device) * 0.1
+    ref = qwen36_ops.kv_norm_permute(kv, gamma, 1e-6)
+
+    g = torch.npu.NPUGraph()
+    side = torch.npu.Stream()
+    side.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(side):
+        qwen36_ops.kv_norm_permute(kv, gamma, 1e-6)
+    torch.npu.current_stream().wait_stream(side)
+    with torch.npu.graph(g):
+        out = qwen36_ops.kv_norm_permute(kv, gamma, 1e-6)
+    g.replay()
+    torch.npu.synchronize()
+    assert torch.equal(out, ref)

@@ -31,7 +31,9 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+#ifdef VLLM_ASCEND_MLA_PREPROCESS_AVAILABLE
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
+#endif
 #endif
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
@@ -2505,6 +2507,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "            int slice_offset, int slice_size) -> Tensor");
     ops.impl("sgmv_expand", torch::kPrivateUse1, &vllm_ascend::sgmv_expand);
 
+#ifdef VLLM_ASCEND_MLA_PREPROCESS_AVAILABLE
+    // The mla_preprocess AscendC kernel only builds on C220-class targets
+    // (ascend910_9392); see CMakeLists.txt. Skip the op registration where
+    // the kernel is not compiled in.
     ops.def(
         "mla_preprocess(Tensor hiddenState, Tensor wdqkv,"
         "               Tensor? descale0, Tensor gamma1, Tensor? beta1, Tensor wuq, Tensor? descale1,"
@@ -2517,6 +2523,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                          Tensor q_out1, Tensor kv_cache_out1, Tensor inner_out)"
     );
     ops.impl("mla_preprocess", torch::kPrivateUse1, &vllm_ascend::mla_preprocess);
+#endif
 
     ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
