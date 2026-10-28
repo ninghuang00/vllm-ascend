@@ -808,10 +808,11 @@ class Qwen3_6MLAImplMixin:
         # Compute query and gate together once; the decode/prefill
         # preprocessing below slices the query from this tensor instead of
         # running qg_proj a second time.
-        hs_gathered = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-            hidden_states.contiguous()
+        # Q/gate and KV preprocessing consume the same local attention tokens.
+        # EP ranks own independent attention batches, including dummy batches.
+        q_flat, gate = self.q_proj.forward_q_and_gate(
+            hidden_states[:num_actual_tokens].contiguous()
         )
-        q_flat, gate = self.q_proj.forward_q_and_gate(hs_gathered[:num_actual_tokens])
         self._precomputed_q_flat = q_flat
         self._precomputed_q_num_decode_tokens = num_decode_tokens
 
