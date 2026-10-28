@@ -783,8 +783,8 @@ class Qwen3_6MLAImplMixin:
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor],
         attn_metadata,
-        need_gather_q_kv: bool = False,
         output: torch.Tensor | None = None,
+        need_gather_q_kv: bool = False,
     ) -> torch.Tensor:
         assert output is not None
         if attn_metadata is None:
@@ -809,7 +809,7 @@ class Qwen3_6MLAImplMixin:
         # preprocessing below slices the query from this tensor instead of
         # running qg_proj a second time.
         hs_gathered = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-            hidden_states.contiguous(), need_gather_q_kv
+            hidden_states.contiguous()
         )
         q_flat, gate = self.q_proj.forward_q_and_gate(hs_gathered[:num_actual_tokens])
         self._precomputed_q_flat = q_flat
@@ -817,7 +817,7 @@ class Qwen3_6MLAImplMixin:
 
         # ── MLA Preprocess ──
         decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
-            layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
+            layer_name, hidden_states, kv_cache, attn_metadata
         )
         # The stash is only valid inside _mla_preprocess of this forward call.
         self._precomputed_q_flat = None
